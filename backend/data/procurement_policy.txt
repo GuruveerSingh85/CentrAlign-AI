@@ -1,0 +1,9 @@
+
+Sample Procurement Policy
+
+1. A vendor record must include the vendor's legal name and website.
+2. Registration numbers must be checked for duplicates when available.
+3. Missing or uncertain information must not be invented.
+4. Vendor registration requires explicit human approval.
+5. After registration, the saved record must be retrieved and checked.
+6. If the policy cannot be satisfied, request human assistance.
