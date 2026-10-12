@@ -20,6 +20,9 @@ export function normalizeStatusClass(status) {
 export function getWorkflowProgress(plan, state, taskStatus) {
   return (plan?.steps || []).map((step) => {
     const complete = state?.completed_steps?.includes(step.step) || false;
+    const active = !complete
+      && state?.current_step === step.step
+      && ["processing", "running", "executing"].includes(String(taskStatus || "").toLowerCase());
     const waitingForApproval = ["awaiting_approval", "waiting_for_approval"].includes(taskStatus)
       && state?.current_step === step.step;
     const waitingForInput = ["needs_input", "waiting_for_input"].includes(taskStatus)
@@ -29,6 +32,7 @@ export function getWorkflowProgress(plan, state, taskStatus) {
       step: step.step,
       action: step.action,
       complete,
+      active,
       waitingForApproval,
       waitingForInput,
       label: complete
@@ -37,9 +41,84 @@ export function getWorkflowProgress(plan, state, taskStatus) {
           ? "Awaiting approval"
           : waitingForInput
             ? "Waiting for information"
-            : "Pending",
+            : active
+              ? "In progress"
+              : "Pending",
     };
   });
+}
+
+export function getTaskResultPresentation(state, plan, taskStatus) {
+  const records = Array.isArray(state?.step_results)
+    ? state.step_results
+    : Array.isArray(state)
+      ? state
+      : [];
+  const planSteps = new Map((plan?.steps || []).map((step) => [step.step, step]));
+  const steps = records.map((record) => {
+    const output = record.outputs || record.result || record.output || null;
+    const success = record.success === true || output?.success === true;
+    return {
+      step: record.step,
+      action: planSteps.get(record.step)?.action || record.action || record.capability || "Task action",
+      capability: record.capability || null,
+      status: record.status || (success ? "completed" : "failed"),
+      success,
+      output,
+    };
+  });
+  const files = [];
+  const sources = new Set();
+  const reports = [];
+
+  function inspect(value) {
+    if (typeof value === "string") {
+      for (const match of value.match(/https?:\/\/[^\s<>"']+/gi) || []) {
+        sources.add(match.replace(/[),.;!?]+$/g, ""));
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(inspect);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    Object.values(value).forEach(inspect);
+  }
+
+  records.forEach((record) => {
+    const output = record.outputs || record.result || record.output || {};
+    inspect(output);
+    if (record.capability === "files.create" && output.path) {
+      files.push({ path: output.path, size: output.size_bytes, digest: output.sha256 });
+    }
+    if (typeof output.report_markdown === "string") {
+      reports.push(output.report_markdown);
+    }
+  });
+
+  const failures = steps.filter((step) => !step.success && ["failed", "waiting_for_input"].includes(step.status));
+  const limitations = [...new Set([...(plan?.limitations || []), ...(state?.limitations || [])])];
+  const status = String(taskStatus || "").toLowerCase();
+  const partial = status === "partially_completed"
+    || (failures.length > 0 && steps.some((step) => step.success));
+  const blockingIssues = [
+    ...(state?.missing_information || []),
+    ...(state?.error ? [state.error] : []),
+    ...failures.map((step) => `${step.action}: ${step.output?.error || "The step did not complete."}`),
+  ];
+
+  return {
+    summary: state?.final_summary || state?.error || null,
+    partial,
+    steps,
+    files,
+    sources: [...sources],
+    reports,
+    failures,
+    limitations,
+    blockingIssues: [...new Set(blockingIssues)],
+  };
 }
 
 export function getApprovalProposal(approval) {

@@ -798,6 +798,236 @@ input {
   background: #168477;
 }
 
+.sidebar button.nav-item {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #b8c6df;
+  text-align: left;
+  font: inherit;
+}
+
+.sidebar button.nav-item.active {
+  background: #263752;
+  color: #fff;
+}
+
+.task-side-column {
+  display: grid;
+  min-width: 0;
+  gap: 18px;
+}
+
+.history-panel,
+.execution-panel {
+  min-width: 0;
+}
+
+.input-details {
+  margin: 12px 0 16px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.input-details summary,
+.result-step summary,
+.result-group > summary {
+  padding: 12px 0;
+  color: #34423d;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.inputs-editor {
+  min-height: 92px !important;
+  font-family: Consolas, "Courier New", monospace !important;
+}
+
+.start-task-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid #cde4da;
+  border-radius: 8px;
+  background: #f2faf6;
+}
+
+.start-task-bar strong {
+  font-size: 12px;
+}
+
+.start-task-bar p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.start-task-bar .primary-button {
+  width: auto;
+  flex-shrink: 0;
+}
+
+.monitor-section,
+.result-section {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.monitor-section h3,
+.result-section h3 {
+  margin-top: 0;
+}
+
+.workflow-step.active {
+  border-color: #168477;
+  background: #f0f8f5;
+}
+
+.workflow-step small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.monitor-action {
+  width: auto;
+  margin-top: 14px;
+}
+
+.result-group,
+.blocking-issues {
+  margin-top: 18px;
+}
+
+.result-group h4,
+.blocking-issues h4 {
+  margin: 0 0 9px;
+  font-size: 12px;
+}
+
+.result-file {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.result-file strong,
+.result-file span {
+  font-size: 11px;
+}
+
+.result-file span {
+  color: var(--muted);
+  text-align: right;
+}
+
+.source-list,
+.blocking-issues ul,
+.result-group ul {
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.source-list a {
+  overflow-wrap: anywhere;
+  color: #11695f;
+}
+
+.result-step {
+  padding: 0 12px;
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.result-step summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.result-step summary span:first-child {
+  overflow-wrap: anywhere;
+}
+
+.report-output {
+  max-height: 420px;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fbfcfb;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.6 Consolas, "Courier New", monospace;
+}
+
+.approval-actions .primary-button {
+  width: auto;
+}
+
+@media (max-width: 720px) {
+  .sidebar {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .brand {
+    width: 100%;
+    padding: 0 0 8px;
+  }
+
+  .sidebar .nav-item {
+    display: flex;
+    flex: 1 1 auto;
+    width: auto;
+    justify-content: center;
+    padding: 10px 8px;
+    font-size: 11px;
+  }
+
+  .sidebar-footer {
+    width: 100%;
+    margin-top: 4px;
+  }
+
+  .main-content {
+    width: 100%;
+  }
+
+  .start-task-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .start-task-bar .primary-button {
+    width: 100%;
+  }
+
+  .result-file {
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .result-file span {
+    text-align: left;
+  }
+}
+
 .primary-button:hover:not(:disabled) {
   background: #11695f;
 }

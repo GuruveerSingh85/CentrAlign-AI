@@ -96,7 +96,6 @@ async def require_unified_workflow(request: Request, call_next):
     manual_workflow_action = path.startswith("/api/legacy/") or (
         path.startswith("/api/tasks/")
         and path.rsplit("/", 1)[-1] in {
-            "plan",
             "execute-policy",
             "execute",
             "vendor-proposal",
@@ -127,6 +126,33 @@ class RunTaskRequest(SQLModel):
     vendor_website: str | None = None
     registration_number: str | None = None
     inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+def _task_inputs(payload: RunTaskRequest) -> dict[str, Any]:
+    inputs = {
+        key: value
+        for key, value in payload.inputs.items()
+        if value not in (None, "")
+    }
+    for key, value in {
+        "name": (payload.vendor_name or "").strip(),
+        "website": (payload.vendor_website or "").strip(),
+        "registration_number": (payload.registration_number or "").strip(),
+    }.items():
+        if value:
+            inputs[key] = value
+    if contains_secret_material(inputs):
+        raise HTTPException(status_code=422, detail="Credential-like values cannot be stored in task inputs.")
+    return inputs
+
+
+def _merge_task_inputs(state: dict, inputs: dict[str, Any]) -> None:
+    state["inputs"].update(inputs)
+    state["vendor"].update({
+        "name": inputs.get("name") or inputs.get("vendor_name") or state["vendor"].get("name"),
+        "website": inputs.get("website") or inputs.get("vendor_website") or state["vendor"].get("website"),
+        "registration_number": inputs.get("registration_number") or state["vendor"].get("registration_number"),
+    })
 
 
 def _owned_task(session: Session, task_id: int, owner_id: str):
@@ -176,18 +202,54 @@ def list_tasks(background_tasks: BackgroundTasks, request: Request):
     return tasks
 
 @app.post("/api/tasks/{task_id}/plan")
-def plan_task(task_id: int, request: Request):
+def plan_task(
+    task_id: int,
+    request: Request,
+    payload: RunTaskRequest = RunTaskRequest(),
+):
+    inputs = _task_inputs(payload)
     with Session(engine) as session:
         task = _owned_task(session, task_id, request.state.owner_id)
 
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
 
+        if task.status not in {"pending", "planned", "waiting_for_input", "needs_input"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task cannot be planned from status '{task.status}'.",
+            )
+
         objective = task.objective
+        owner_id = task.owner_id
+        state = workflow._state_from_task(task)
+        _merge_task_inputs(state, inputs)
+        state.pop("error", None)
+        state["final_summary"] = None
+        workflow._save_state(task, state)
+        workflow._add_event(session, task_id, "planning_started", "The backend is preparing a validated plan.", {
+            "input_fields": sorted(inputs),
+        })
+        session.add(task)
+        session.commit()
 
     try:
-        plan = create_plan(objective)
+        with Session(engine) as session:
+            memory_context = workflow.retrieve_context_safely(session, owner_id, objective)
+        planner_plan = workflow._create_plan_with_memory(objective, inputs, memory_context)
+        plan, next_workflow = workflow._validated_plan(objective, planner_plan)
     except Exception as exc:
+        with Session(engine) as session:
+            task = _owned_task(session, task_id, owner_id)
+            if task is not None:
+                state = workflow._state_from_task(task)
+                message = f"Plan preview failed: {str(exc)}"
+                state["error"] = message
+                state["final_summary"] = message
+                workflow._save_state(task, state)
+                workflow._add_event(session, task_id, "plan_failed", message)
+                session.add(task)
+                session.commit()
         raise HTTPException(
             status_code=502,
             detail=f"Planning failed: {str(exc)}",
@@ -198,15 +260,37 @@ def plan_task(task_id: int, request: Request):
 
         if task is None:
             raise HTTPException(status_code=404, detail="Task not found")
+        if task.status not in {"pending", "planned", "waiting_for_input", "needs_input"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task cannot be planned from status '{task.status}'.",
+            )
 
+        state = workflow._state_from_task(task)
+        _merge_task_inputs(state, inputs)
+        state["workflow"] = next_workflow
+        state["missing_information"] = plan.get("missing_information", [])
+        state["final_summary"] = (
+            " ".join(plan.get("limitations", []))
+            if next_workflow == "unsupported"
+            else None
+        )
+        state.pop("error", None)
         task.plan_json = json.dumps(plan)
-        task.status = "planned"
+        task.status = (
+            "unsupported" if next_workflow == "unsupported"
+            else "waiting_for_input" if next_workflow == "needs_input"
+            else "planned"
+        )
+        workflow._save_state(task, state)
+        workflow._add_event(session, task_id, "plan_previewed", "A validated execution plan was prepared for review.", plan)
+        task_status = task.status
         session.add(task)
         session.commit()
 
     return {
         "task_id": task_id,
-        "status": "planned",
+        "status": task_status,
         "plan": plan,
     }
 
@@ -1004,20 +1088,7 @@ def run_task_unified(
     request: Request,
     payload: RunTaskRequest = RunTaskRequest(),
 ):
-    vendor_context = {
-        key: value
-        for key, value in payload.inputs.items()
-        if value not in (None, "")
-    }
-    for key, value in {
-        "name": (payload.vendor_name or "").strip(),
-        "website": (payload.vendor_website or "").strip(),
-        "registration_number": (payload.registration_number or "").strip(),
-    }.items():
-        if value:
-            vendor_context[key] = value
-    if contains_secret_material(vendor_context):
-        raise HTTPException(status_code=422, detail="Credential-like values cannot be stored in task inputs.")
+    vendor_context = _task_inputs(payload)
 
     with Session(engine) as session:
         task = _owned_task(session, task_id, request.state.owner_id)

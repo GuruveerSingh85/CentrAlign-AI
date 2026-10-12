@@ -6,6 +6,7 @@ import {
   getLatestActivity,
   getRecoveryAttempts,
   getTaskStatusMessage,
+  getTaskResultPresentation,
   getVerificationSummary,
   getWorkflowProgress,
   normalizeStatusClass,
@@ -38,6 +39,54 @@ describe("workflow status presentation", () => {
       getWorkflowProgress(plan, state, "awaiting_approval").map((step) => step.label),
       ["Complete", "Awaiting approval"],
     );
+    assert.equal(getWorkflowProgress(plan, state, "running")[1].label, "In progress");
+  });
+
+  it("presents persisted tool outputs, source links, generated files, and partial failures", () => {
+    const presentation = getTaskResultPresentation({
+      completed_steps: [1],
+      final_summary: "One step completed before execution stopped.",
+      step_results: [
+        {
+          step: 1,
+          capability: "files.create",
+          status: "completed",
+          success: true,
+          outputs: {
+            success: true,
+            path: "reports/result.md",
+            size_bytes: 42,
+            sha256: "digest",
+            source: "https://example.com/source",
+            report_markdown: "Read more: https://example.com/report-source.",
+          },
+        },
+        {
+          step: 2,
+          capability: "web.fetch_page",
+          status: "failed",
+          success: false,
+          result: { error: "The website is unavailable." },
+        },
+      ],
+    }, {
+      limitations: ["External access is restricted."],
+      steps: [{ step: 1, action: "Write report" }, { step: 2, action: "Fetch source" }],
+    }, "partially_completed");
+
+    assert.equal(presentation.partial, true);
+    assert.deepEqual(presentation.files, [{
+      path: "reports/result.md",
+      size: 42,
+      digest: "digest",
+    }]);
+    assert.deepEqual(presentation.sources, [
+      "https://example.com/source",
+      "https://example.com/report-source",
+    ]);
+    assert.equal(presentation.reports[0], "Read more: https://example.com/report-source.");
+    assert.deepEqual(presentation.limitations, ["External access is restricted."]);
+    assert.equal(presentation.blockingIssues[0], "Fetch source: The website is unavailable.");
   });
 
   it("renders the exact saved approval proposal without inventing details", () => {

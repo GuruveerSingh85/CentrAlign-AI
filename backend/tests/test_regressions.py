@@ -154,6 +154,64 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["id"]
 
+    def test_plan_preview_accepts_and_persists_supplied_inputs(self):
+        task_id = self.create_task("Register Acme Supply as a vendor.")
+        inputs = {
+            "name": "Acme Supply",
+            "website": "https://acme.example",
+            "registration_number": "AC-100",
+        }
+
+        with patch("app.workflow.create_plan", return_value=self.policy_plan()) as planner:
+            response = self.client.post(
+                f"/api/tasks/{task_id}/plan",
+                json={"inputs": inputs},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        planner.assert_called_once()
+        self.assertEqual(
+            planner.call_args.args[:2],
+            ("Register Acme Supply as a vendor.", inputs),
+        )
+        self.assertEqual(response.json()["status"], "planned")
+        self.assertEqual(len(response.json()["plan"]["steps"]), 4)
+        saved_task = next(
+            task for task in self.client.get("/api/tasks").json()
+            if task["id"] == task_id
+        )
+        self.assertEqual(json.loads(saved_task["plan_json"]), response.json()["plan"])
+        self.assertEqual(json.loads(saved_task["result_json"])["inputs"], inputs)
+        event_types = [
+            event["event_type"]
+            for event in self.client.get(f"/api/tasks/{task_id}/events").json()["events"]
+        ]
+        self.assertIn("plan_previewed", event_types)
+
+    def test_failed_plan_preview_keeps_inputs_for_retry(self):
+        task_id = self.create_task("Review the procurement policy.")
+        inputs = {"policy_version": "2026"}
+
+        with patch("app.workflow.create_plan", side_effect=RuntimeError("planner unavailable")):
+            response = self.client.post(
+                f"/api/tasks/{task_id}/plan",
+                json={"inputs": inputs},
+            )
+
+        self.assertEqual(response.status_code, 502)
+        saved_task = next(
+            task for task in self.client.get("/api/tasks").json()
+            if task["id"] == task_id
+        )
+        self.assertEqual(json.loads(saved_task["result_json"])["inputs"], inputs)
+        self.assertIn(
+            "plan_failed",
+            [
+                event["event_type"]
+                for event in self.client.get(f"/api/tasks/{task_id}/events").json()["events"]
+            ],
+        )
+
     @staticmethod
     def policy_plan():
         return {
