@@ -1,4 +1,4 @@
-﻿import json
+import json
 import hashlib
 import inspect
 import time
@@ -9,8 +9,8 @@ from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import update
 from sqlmodel import Session
 
-from app.agent import create_plan
-from app.approval_control import (
+from app.services.agent import create_plan
+from app.services.approval_control import (
     approval_is_expired,
     approval_parameters,
     describe_action,
@@ -18,12 +18,12 @@ from app.approval_control import (
     proposal_digest,
     proposal_is_unchanged,
 )
-from app.database import engine
-from app.models import Approval, Task, Vendor
-from app.memory import retrieve_context_safely
-from app.tool_registry import TOOL_CONTRACTS, TOOLS, _schema_error, execute_tool, read_company_policy
-from app.security import classify_action, resolve_permissions
-from app.workflow_support.constants import (
+from app.core.database import engine
+from app.core.models import Approval, Task, Vendor
+from app.services.memory import retrieve_context_safely
+from app.tools.registry import TOOL_CONTRACTS, TOOLS, _schema_error, execute_tool, read_company_policy
+from app.core.security import classify_action, resolve_permissions
+from app.workflows.support.constants import (
     MAX_PARALLEL_STEPS,
     MAX_WORKFLOW_REPLANS,
     MAX_WORKFLOW_STEPS,
@@ -35,7 +35,7 @@ from app.workflow_support.constants import (
     _scheduled_tasks,
     _task_lock,
 )
-from app.workflow_support.execution import (
+from app.workflows.support.execution import (
     _decide_after_observation,
     _execute_observed_tool,
     _finish_policy_verification,
@@ -46,8 +46,8 @@ from app.workflow_support.execution import (
     _record_recovery_attempt,
     _write_failure,
 )
-from app.workflow_support.plan import _validated_plan
-from app.workflow_support.state import _add_event, _new_state, _save_state, _state_from_task
+from app.workflows.support.plan import _validated_plan
+from app.workflows.support.state import _add_event, _new_state, _save_state, _state_from_task
 
 
 def schedule_workflow(

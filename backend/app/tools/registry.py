@@ -16,18 +16,18 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from app.database import engine
-from app.models import Approval, ExecutionEvent, Task, Vendor
-from app.approval_control import (
+from app.core.database import engine
+from app.core.models import Approval, ExecutionEvent, Task, Vendor
+from app.services.approval_control import (
     approval_is_expired,
     approval_parameters,
     describe_action,
     proposal_digest,
     proposal_is_unchanged,
 )
-from app.security import classify_action, contains_secret_material, resolve_permissions, risk_as_dict
+from app.core.security import classify_action, contains_secret_material, resolve_permissions, risk_as_dict
 
-POLICY_PATH = Path(__file__).resolve().parents[1] / "data" / "procurement_policy.txt"
+POLICY_PATH = Path(__file__).resolve().parents[2] / "data" / "procurement_policy.txt"
 logger = logging.getLogger(__name__)
 
 
@@ -995,9 +995,9 @@ def execute_tool(
         return result
 
 
-from app.document_tools import register_document_tools
-from app.file_tools import register_file_tools
-from app.web_tools import register_web_tools
+from app.tools.documents import register_document_tools
+from app.tools.files import register_file_tools
+from app.tools.web import register_web_tools
 
 register_file_tools(register_tool)
 register_document_tools(register_tool)

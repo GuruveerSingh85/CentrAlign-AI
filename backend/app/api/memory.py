@@ -3,8 +3,8 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from sqlmodel import Session, SQLModel, select
 
-from app.database import engine
-from app.memory import (
+from app.core.database import engine
+from app.services.memory import (
     _ALLOWED_CATEGORIES,
     _ALLOWED_KINDS,
     _ALLOWED_VERIFICATION,
@@ -12,7 +12,7 @@ from app.memory import (
     retrieve_context_safely,
     validate_memory_content,
 )
-from app.models import Memory
+from app.core.models import Memory
 
 router = APIRouter(prefix="/api")
 

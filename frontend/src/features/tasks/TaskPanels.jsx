@@ -1,4 +1,4 @@
-import { normalizeStatusClass } from "./workflowPresentation.js";
+import { normalizeStatusClass } from "../workflows/workflowPresentation.js";
 
 export function StatusBadge({ status }) {
   const value = String(status || "pending").replaceAll("_", " ");

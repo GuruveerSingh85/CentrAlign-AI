@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { shouldPollTask } from "./workflowPresentation.js";
-import { apiRequest } from "./api.js";
-import { TaskComposer, TaskHistory } from "./TaskPanels.jsx";
-import ExecutionMonitor from "./ExecutionMonitor.jsx";
-import ApprovalCenter from "./ApprovalCenter.jsx";
+import { shouldPollTask } from "../features/workflows/workflowPresentation.js";
+import { apiRequest } from "../api/api.js";
+import { TaskComposer, TaskHistory } from "../features/tasks/TaskPanels.jsx";
+import ExecutionMonitor from "../features/tasks/ExecutionMonitor.jsx";
+import ApprovalCenter from "../features/approvals/ApprovalCenter.jsx";
 import "./App.css";
 
 function formatRunNotice(result) {

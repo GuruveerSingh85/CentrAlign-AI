@@ -1,3 +1,4 @@
+import asyncio
 import errno
 import json
 import os
@@ -12,9 +13,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app import main, tool_registry, workflow
-from app.models import Task, Vendor
-from app.tool_registry import execute_tool, check_policy, get_registered_tool_contracts
+from app import main
+from app.tools import registry as tool_registry
+from app.workflows import engine as workflow
+from app.core.models import Task, Vendor
+from app.tools.registry import execute_tool, check_policy, get_registered_tool_contracts
 
 
 class ToolRegistryRegressionTests(unittest.TestCase):
@@ -50,7 +53,7 @@ class ToolRegistryRegressionTests(unittest.TestCase):
         self.assertEqual(result["failure_type"], "approval_required")
 
     def test_only_known_transient_file_and_database_errors_are_retryable(self):
-        with self.assertLogs("app.tool_registry", level="ERROR"):
+        with self.assertLogs("app.tools.registry", level="ERROR"):
             with patch.object(
                 type(tool_registry.POLICY_PATH),
                 "read_text",
@@ -101,7 +104,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.client = TestClient(main.app)
         self.client.__enter__()
         self.planner_patcher = patch(
-            "app.workflow.create_plan",
+            "app.workflows.engine.create_plan",
             return_value={
                 "goal": "Complete the procurement request safely.",
                 "success_criteria": ["Use the procurement policy and verify the result."],
@@ -162,7 +165,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "registration_number": "AC-100",
         }
 
-        with patch("app.workflow.create_plan", return_value=self.policy_plan()) as planner:
+        with patch("app.workflows.engine.create_plan", return_value=self.policy_plan()) as planner:
             response = self.client.post(
                 f"/api/tasks/{task_id}/plan",
                 json={"inputs": inputs},
@@ -192,7 +195,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         task_id = self.create_task("Review the procurement policy.")
         inputs = {"policy_version": "2026"}
 
-        with patch("app.workflow.create_plan", side_effect=RuntimeError("planner unavailable")):
+        with patch("app.workflows.engine.create_plan", side_effect=RuntimeError("planner unavailable")):
             response = self.client.post(
                 f"/api/tasks/{task_id}/plan",
                 json={"inputs": inputs},
@@ -316,7 +319,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         return handler
 
     def test_policy_read_is_independently_verified(self):
-        with patch("app.workflow.create_plan", return_value=self.policy_plan()):
+        with patch("app.workflows.engine.create_plan", return_value=self.policy_plan()):
             task_id = self.create_task("Review the procurement policy.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
         self.assertEqual(response.status_code, 202, response.text)
@@ -333,7 +336,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             calls.append(capability)
             return original_execute(capability, context)
 
-        with patch("app.workflow.execute_tool", side_effect=capture_execute):
+        with patch("app.workflows.engine.execute_tool", side_effect=capture_execute):
             task_id = self.start_vendor_task(include_details=False)
             first_state = json.loads(self.read_task(task_id).result_json)
             self.assertEqual(self.read_task(task_id).status, "waiting_for_input")
@@ -454,8 +457,8 @@ class AutonomousWorkflowTests(unittest.TestCase):
                     }
             return original_execute(capability, context)
 
-        with patch("app.workflow.create_plan", return_value=self.policy_plan()), patch(
-            "app.workflow.execute_tool", side_effect=fail_twice_then_execute
+        with patch("app.workflows.engine.create_plan", return_value=self.policy_plan()), patch(
+            "app.workflows.engine.execute_tool", side_effect=fail_twice_then_execute
         ):
             task_id = self.create_task("Review the procurement policy.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
@@ -540,7 +543,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "requires_approval": False,
             "expected_result": "The approved record update is applied.",
         }]}
-        with patch("app.workflow.create_plan", return_value=planner_plan):
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
             task_id = self.create_task("Update record 42 by 25.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
 
@@ -581,7 +584,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "requires_approval": False,
             "expected_result": "The approved record update is applied.",
         }]}
-        with patch("app.workflow.create_plan", return_value=planner_plan):
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
             task_id = self.create_task("Update record 42 by 25.")
             self.client.post(f"/api/tasks/{task_id}/run", json={})
         approval_id = json.loads(self.read_task(task_id).result_json)["approval_id"]
@@ -756,7 +759,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.read_vendors()), 1)
         self.assertEqual(self.client.get("/api/approvals?status=pending").json(), [])
 
-    def test_processing_task_recovers_from_saved_plan_after_reload(self):
+    def test_processing_task_recovers_at_startup_not_during_task_listing(self):
         task = Task(
             objective="Review the procurement policy.",
             status="processing",
@@ -792,6 +795,13 @@ class AutonomousWorkflowTests(unittest.TestCase):
 
         response = self.client.get("/api/tasks")
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.read_task(task_id).status, "processing")
+
+        recovery_tasks = main._schedule_startup_recovery()
+        duplicate_recovery = main._schedule_startup_recovery()
+        self.assertEqual(len(recovery_tasks.tasks), 1)
+        self.assertEqual(len(duplicate_recovery.tasks), 0)
+        asyncio.run(recovery_tasks())
         self.assertEqual(self.read_task(task_id).status, "completed")
 
     def test_restart_resume_does_not_repeat_completed_policy_read(self):
@@ -842,17 +852,87 @@ class AutonomousWorkflowTests(unittest.TestCase):
             called_capabilities.append(capability)
             return original_execute(capability, context)
 
-        with patch("app.workflow.execute_tool", side_effect=record_execute):
+        with patch("app.workflows.engine.execute_tool", side_effect=record_execute):
             response = self.client.get("/api/tasks")
 
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.read_task(task_id).status, "processing")
+        recovery_tasks = main._schedule_startup_recovery()
+        asyncio.run(recovery_tasks())
         self.assertEqual(self.read_task(task_id).status, "waiting_for_input")
         self.assertNotIn("read_company_policy", called_capabilities)
         state = json.loads(self.read_task(task_id).result_json)
         self.assertIn(1, state["completed_steps"])
 
+    def test_restart_does_not_repeat_an_interrupted_side_effect(self):
+        capability = "test_interrupted_side_effect"
+        handler = Mock(return_value={"success": True, "value": "done"})
+        tool_registry.register_tool(
+            capability,
+            handler,
+            description="Record a side effect for restart recovery coverage.",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            outputs=["value"],
+            permissions=["business:read"],
+            side_effect=True,
+            permission_gated_side_effect=True,
+        )
+        self.addCleanup(tool_registry.TOOLS.pop, capability, None)
+        self.addCleanup(tool_registry.TOOL_CONTRACTS.pop, capability, None)
+        task = Task(
+            objective="Perform one side effect.",
+            status="running",
+            plan_json=json.dumps({"steps": [{
+                "step": 1,
+                "action": "Perform the registered side effect",
+                "capability": capability,
+                "depends_on": [],
+                "inputs": {},
+                "requires_approval": False,
+                "expected_result": "The side effect is recorded.",
+            }]}),
+            result_json=json.dumps({
+                "workflow": "registered_tool_plan",
+                "step_results": [{
+                    "step": 1,
+                    "capability": capability,
+                    "status": "running",
+                    "inputs": {},
+                    "success": False,
+                }],
+            }),
+        )
+        with Session(self.test_engine) as session:
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            task_id = task.id
+
+        recovery_tasks = main._schedule_startup_recovery()
+        asyncio.run(recovery_tasks())
+
+        self.assertEqual(self.read_task(task_id).status, "failed")
+        handler.assert_not_called()
+        state = json.loads(self.read_task(task_id).result_json)
+        self.assertTrue(state["step_results"][0]["result"]["outcome_unknown"])
+
+    def test_legacy_manual_execution_routes_are_gone_with_410(self):
+        legacy_paths = [
+            "/api/tasks/1/execute-policy",
+            "/api/tasks/1/execute",
+            "/api/tasks/1/vendor-proposal",
+            "/api/tasks/1/verify",
+            "/api/legacy/tasks/1/run",
+            "/api/legacy/approvals/1/decide",
+        ]
+        for path in legacy_paths:
+            with self.subTest(path=path):
+                response = self.client.post(path, json={})
+                self.assertEqual(response.status_code, 410, response.text)
+                self.assertIn("/api/tasks/{task_id}/run", response.json()["detail"])
+
     def test_unsupported_planner_capability_fails_safely(self):
-        with patch("app.workflow.create_plan", return_value={
+        with patch("app.workflows.engine.create_plan", return_value={
             "goal": "Run a shell command",
             "steps": [{"step": 1, "capability": "run_shell", "action": "Execute shell"}],
         }):
@@ -894,7 +974,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             ],
             "risks": [],
         }
-        with patch("app.workflow.create_plan", return_value=planner_plan):
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
             task_id = self.create_task("Check vendor number MULTI-STEP-1 for a duplicate.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
 
@@ -939,7 +1019,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "success_criteria": ["The note identifies the requested subject."],
             }],
         }
-        with patch("app.workflow.create_plan", return_value=planner_plan):
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
             task_id = self.create_task("Prepare a note about the quarter close.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
 
@@ -975,7 +1055,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "expected_result": "The forecast is updated.",
             }],
         }
-        with patch("app.workflow.create_plan", return_value=planner_plan):
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
             task_id = self.create_task("Update the quarterly forecast.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
 
@@ -1012,7 +1092,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 },
             ],
         }
-        with patch("app.workflow.create_plan", return_value=planner_plan):
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
             task_id = self.create_task("Validate supplier details against procurement safeguards.")
             initial = self.client.post(f"/api/tasks/{task_id}/run", json={})
 
@@ -1061,7 +1141,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             planning_contexts.append(provided_information or {})
             return initial_plan if len(planning_contexts) == 1 else completed_plan
 
-        with patch("app.workflow.create_plan", side_effect=plan_with_context):
+        with patch("app.workflows.engine.create_plan", side_effect=plan_with_context):
             task_id = self.create_task("Review procurement policy for a business unit.")
             initial = self.client.post(f"/api/tasks/{task_id}/run", json={})
             self.assertEqual(initial.status_code, 202, initial.text)
@@ -1090,21 +1170,21 @@ class AutonomousWorkflowTests(unittest.TestCase):
             })
 
     def test_tool_failure_does_not_complete_task(self):
-        with patch("app.workflow.execute_tool", return_value={
+        with patch("app.workflows.engine.execute_tool", return_value={
             "success": False,
             "error": "Controlled test failure.",
             "failure_type": "test_failure",
-        }), patch("app.workflow.create_plan", return_value=self.policy_plan()):
+        }), patch("app.workflows.engine.create_plan", return_value=self.policy_plan()):
             task_id = self.create_task("Review the procurement policy.")
             self.client.post(f"/api/tasks/{task_id}/run", json={})
         self.assertEqual(self.read_task(task_id).status, "failed")
 
     def test_policy_verification_mismatch_is_not_success(self):
-        with patch("app.workflow.read_company_policy", return_value={
+        with patch("app.workflows.engine.read_company_policy", return_value={
             "success": True,
             "policy_text": "Changed policy source",
             "source": "controlled-test-source",
-        }), patch("app.workflow.create_plan", return_value=self.policy_plan()):
+        }), patch("app.workflows.engine.create_plan", return_value=self.policy_plan()):
             task_id = self.create_task("Review the procurement policy.")
             self.client.post(f"/api/tasks/{task_id}/run", json={})
         task = self.read_task(task_id)
@@ -1125,6 +1205,43 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(repeated_decision.status_code, 409)
         self.assertEqual(repeated_run.status_code, 409)
         self.assertEqual(len(self.read_vendors()), 1)
+
+    def test_concurrent_run_requests_execute_a_task_once(self):
+        task_id = self.create_task("Review the procurement policy.")
+        execution_started = threading.Event()
+        allow_execution_to_finish = threading.Event()
+        calls = []
+        original_execute = workflow.execute_tool
+        responses = []
+
+        def blocking_execute(capability, context=None):
+            calls.append(capability)
+            execution_started.set()
+            if not allow_execution_to_finish.wait(timeout=5):
+                raise TimeoutError("Test did not release the tool call.")
+            return original_execute(capability, context)
+
+        def start_first_request():
+            responses.append(self.client.post(f"/api/tasks/{task_id}/run", json={}))
+
+        with patch("app.workflows.engine.create_plan", return_value=self.policy_plan()), patch(
+            "app.workflows.engine.execute_tool", side_effect=blocking_execute
+        ):
+            request_thread = threading.Thread(target=start_first_request)
+            request_thread.start()
+            try:
+                self.assertTrue(execution_started.wait(timeout=5))
+                duplicate = self.client.post(f"/api/tasks/{task_id}/run", json={})
+            finally:
+                allow_execution_to_finish.set()
+                request_thread.join(timeout=5)
+
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0].status_code, 202, responses[0].text)
+        self.assertEqual(duplicate.status_code, 409, duplicate.text)
+        self.assertEqual(calls, ["read_company_policy"])
+        self.assertEqual(self.read_task(task_id).status, "completed")
 
     def test_validated_plan_rejects_circular_dependencies(self):
         with self.assertRaisesRegex(ValueError, "circular"):
@@ -1185,7 +1302,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 },
             ],
         }
-        with patch("app.workflow.create_plan", return_value=planner_plan):
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
             task_id = self.create_task("Read two independent test values.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
 
@@ -1234,7 +1351,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
             "inputs": {"phase": "follow_up"},
             "expected_result": "The follow-up is completed.",
         }]}
-        with patch("app.workflow.create_plan", side_effect=[initial_plan, replanned_plan]) as planner:
+        with patch("app.workflows.engine.create_plan", side_effect=[initial_plan, replanned_plan]) as planner:
             task_id = self.create_task("Observe the result and choose the next action.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
 
@@ -1273,7 +1390,7 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "expected_result": "Observe the next stage.",
             }]}
 
-        with patch("app.workflow.create_plan", side_effect=make_plan) as planner:
+        with patch("app.workflows.engine.create_plan", side_effect=make_plan) as planner:
             task_id = self.create_task("Repeatedly observe and replan.")
             response = self.client.post(f"/api/tasks/{task_id}/run", json={})
 

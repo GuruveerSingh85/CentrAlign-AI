@@ -6,23 +6,23 @@ from datetime import datetime, timezone
 
 from sqlmodel import Session
 
-from app.database import engine as default_engine
-from app.models import Approval, Task, Vendor
-from app.memory import record_verified_procedure
-from app.tool_registry import TOOL_CONTRACTS, execute_tool, read_company_policy, verify_registered_tool
-from app.workflow_support.constants import (
+from app.core.database import engine as default_engine
+from app.core.models import Approval, Task, Vendor
+from app.services.memory import record_verified_procedure
+from app.tools.registry import TOOL_CONTRACTS, execute_tool, read_company_policy, verify_registered_tool
+from app.workflows.support.constants import (
     DEFAULT_TOOL_TIMEOUT_SECONDS,
     MAX_SAFE_RETRIES,
     SAFE_RETRY_CAPABILITIES,
     TRANSIENT_FAILURE_TYPES,
     serialized_task_state,
 )
-from app.workflow_support.state import _add_event, _save_state, _state_from_task
+from app.workflows.support.state import _add_event, _save_state, _state_from_task
 
 
 def _workflow_module():
     try:
-        import app.workflow as workflow_module
+        import app.workflows.engine as workflow_module
     except ImportError:
         return None
     return workflow_module

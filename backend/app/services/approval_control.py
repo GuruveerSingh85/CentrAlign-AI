@@ -5,8 +5,8 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
-from app.models import Approval, Task
-from app.security import ActionRisk, contains_secret_material, risk_as_dict
+from app.core.models import Approval, Task
+from app.core.security import ActionRisk, contains_secret_material, risk_as_dict
 
 
 def canonical_json(value: object) -> str:

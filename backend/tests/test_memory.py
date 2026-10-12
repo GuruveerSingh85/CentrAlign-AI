@@ -8,11 +8,13 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from sqlmodel import SQLModel, Session, create_engine, select
 
-from app import main, memory_api, workflow
-from app.database import create_db_and_tables
-from app.memory import record_verified_procedure, retrieve_context, retrieve_context_safely
-from app.models import Memory, Task
-from app.workflow_support import execution
+from app import main
+from app.api import memory as memory_api
+from app.core.database import create_db_and_tables
+from app.services.memory import record_verified_procedure, retrieve_context, retrieve_context_safely
+from app.core.models import Memory, Task
+from app.workflows import engine as workflow
+from app.workflows.support import execution
 
 
 class MemoryTests(unittest.TestCase):
@@ -142,7 +144,7 @@ class MemoryTests(unittest.TestCase):
 
     def test_retrieval_failure_is_reported_without_raising(self):
         with Session(self.test_engine) as session:
-            with patch("app.memory.retrieve_context", side_effect=RuntimeError("database unavailable")):
+            with patch("app.services.memory.retrieve_context", side_effect=RuntimeError("database unavailable")):
                 context = retrieve_context_safely(session, "alice", "policy review")
         self.assertEqual(context["retrieval_status"], "unavailable")
         self.assertEqual(context["memories"], [])

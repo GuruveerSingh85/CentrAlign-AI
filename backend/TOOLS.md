@@ -39,4 +39,6 @@ No web-search provider or approved web-host allowlist is configured, so provider
 
 Only independent tools without side effects run concurrently. Retries are bounded and restricted to known-safe capabilities with transient failure types; interrupted side-effecting steps are recorded as outcome-unknown and are not automatically repeated.
 
+Persisted `running` and `processing` workflows are rescheduled from their checkpoints during application startup. Listing tasks is read-only and does not trigger recovery.
+
 Sensitive registered actions use the existing `Approval` record and approval inbox. The proposal stores the capability, exact execution parameters, inferred target, expected consequences, risk dimensions, an immutable SHA-256 binding, decision identity, and expiry. A changed proposal, expired/cancelled approval, or reused approval cannot reach the handler. Gemini only plans; approval decisions are accepted through the authenticated human API path. Cancellation stops new dispatches, cancels unclaimed approvals, and preserves the outcome of work already in flight.

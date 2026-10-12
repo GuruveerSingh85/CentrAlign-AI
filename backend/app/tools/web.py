@@ -10,7 +10,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from app.file_tools import _failure
+from app.tools.files import _failure
 
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_EXTRACTED_CHARS = 50_000

@@ -3,13 +3,13 @@ from datetime import datetime, timezone
 
 from sqlmodel import Session
 
-from app.database import engine as default_engine
-from app.models import ExecutionEvent, Task
+from app.core.database import engine as default_engine
+from app.core.models import ExecutionEvent, Task
 
 
 def _session_engine():
     try:
-        import app.workflow as workflow_module
+        import app.workflows.engine as workflow_module
     except ImportError:
         return default_engine
     return getattr(workflow_module, "engine", default_engine)

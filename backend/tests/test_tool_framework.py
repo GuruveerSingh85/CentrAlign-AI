@@ -9,9 +9,12 @@ from fastapi.testclient import TestClient
 import httpx
 from pypdf import PdfWriter
 
-from app import document_tools, main, tool_registry, web_tools
-from app.tool_registry import execute_tool, get_registered_tool_contracts
-from app.workflow_support.plan import _validated_plan
+from app import main
+from app.tools import documents as document_tools
+from app.tools import registry as tool_registry
+from app.tools import web as web_tools
+from app.tools.registry import execute_tool, get_registered_tool_contracts
+from app.workflows.support.plan import _validated_plan
 
 
 class ToolFrameworkTests(unittest.TestCase):
@@ -160,7 +163,7 @@ class ToolFrameworkTests(unittest.TestCase):
         self.addCleanup(tool_registry.TOOLS.pop, capability, None)
         self.addCleanup(tool_registry.TOOL_CONTRACTS.pop, capability, None)
 
-        with self.assertLogs("app.tool_registry", level="ERROR"):
+        with self.assertLogs("app.tools.registry", level="ERROR"):
             result = execute_tool(capability, {}, permissions={"business:read"})
         self.assertFalse(result["success"])
         self.assertEqual(result["failure_type"], "tool_error")
@@ -178,7 +181,7 @@ class ToolFrameworkTests(unittest.TestCase):
             )
             self.addCleanup(tool_registry.TOOLS.pop, capability, None)
             self.addCleanup(tool_registry.TOOL_CONTRACTS.pop, capability, None)
-            with self.assertLogs("app.tool_registry", level="ERROR"):
+            with self.assertLogs("app.tools.registry", level="ERROR"):
                 failure = execute_tool(capability, {}, permissions={"business:read"})
             self.assertEqual(failure["failure_type"], expected_type)
 

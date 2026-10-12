@@ -1,11 +1,11 @@
 """Workflow helpers split into focused modules for readability."""
 
-from app.workflow_support.constants import (
+from app.workflows.support.constants import (
     MAX_SAFE_RETRIES,
     SAFE_RETRY_CAPABILITIES,
     TRANSIENT_FAILURE_TYPES,
 )
-from app.workflow_support.execution import (
+from app.workflows.support.execution import (
     _execute_observed_tool,
     _finish_policy_verification,
     _finish_vendor_verification,
@@ -13,8 +13,8 @@ from app.workflow_support.execution import (
     _policy_text_from_state,
     _write_failure,
 )
-from app.workflow_support.plan import _validated_plan
-from app.workflow_support.state import _add_event, _new_state, _save_state, _state_from_task
+from app.workflows.support.plan import _validated_plan
+from app.workflows.support.state import _add_event, _new_state, _save_state, _state_from_task
 
 __all__ = [
     "MAX_SAFE_RETRIES",

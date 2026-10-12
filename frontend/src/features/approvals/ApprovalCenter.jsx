@@ -1,5 +1,5 @@
-import { getApprovalProposal } from "./workflowPresentation.js";
-import { StatusBadge } from "./TaskPanels.jsx";
+import { getApprovalProposal } from "../workflows/workflowPresentation.js";
+import { StatusBadge } from "../tasks/TaskPanels.jsx";
 
 export default function ApprovalCenter({ approvals, busyAction, onDecide, onCancel, onOpenTask }) {
   return (

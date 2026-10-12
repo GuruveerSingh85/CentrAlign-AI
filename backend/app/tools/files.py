@@ -5,7 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 
-DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
+DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
 MAX_FILE_BYTES = 1_000_000
 MAX_RESULTS = 500
 

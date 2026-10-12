@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-from app.agent import create_plan
-from app.workflow import _validated_plan
+from app.services.agent import create_plan
+from app.workflows.engine import _validated_plan
 
 
 @unittest.skipUnless(

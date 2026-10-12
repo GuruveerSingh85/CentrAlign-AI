@@ -1,8 +1,8 @@
 import re
 
-from app.tool_registry import TOOLS, TOOL_CONTRACTS
-from app.security import classify_action
-from app.workflow_support.constants import MAX_WORKFLOW_STEPS
+from app.tools.registry import TOOLS, TOOL_CONTRACTS
+from app.core.security import classify_action
+from app.workflows.support.constants import MAX_WORKFLOW_STEPS
 
 
 def _is_json_value(value) -> bool:

@@ -5,7 +5,7 @@ import {
   getTaskStatusMessage,
   getVerificationSummary,
   getWorkflowProgress,
-} from "./workflowPresentation.js";
+} from "../workflows/workflowPresentation.js";
 import { StatusBadge } from "./TaskPanels.jsx";
 
 function TaskResults({ state, plan, status }) {

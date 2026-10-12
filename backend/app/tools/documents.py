@@ -7,7 +7,7 @@ import json
 import httpx
 from pypdf import PdfReader
 
-from app.file_tools import _failure, _read_authorized_bytes
+from app.tools.files import _failure, _read_authorized_bytes
 
 MAX_DOCUMENT_CHARS = 100_000
 MAX_PDF_PAGES = 100
@@ -34,7 +34,7 @@ def _model_failure(exc: Exception) -> dict:
 
 
 def _invoke_document_model(prompt: str) -> str:
-    from app.agent import get_model
+    from app.services.agent import get_model
 
     return _response_text(get_model().invoke(prompt).content)
 

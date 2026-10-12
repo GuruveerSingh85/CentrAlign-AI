@@ -6,8 +6,8 @@ from typing import TypedDict
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
-from app.tool_registry import get_registered_tool_contracts
-from app.security import contains_secret_material
+from app.tools.registry import get_registered_tool_contracts
+from app.core.security import contains_secret_material
 
 load_dotenv()
 

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, select
 
-from app.models import Memory, Task, utc_now
+from app.core.models import Memory, Task, utc_now
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{1,40}", re.IGNORECASE)
 _CREDENTIAL_PATTERN = re.compile(
