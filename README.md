@@ -9,6 +9,31 @@ This repository contains the CentrAlign AI Operator and a fictional Ledgerly Fin
 - Node.js/npm and Python 3.11+ for local development.
 - Playwright Chromium is needed only when using the backend browser tool.
 
+## LangGraph planner
+
+The compiled `planner_graph` has one node: it prepares a tool plan from the task and context. The application workflow validates and executes registered tools, handles approvals, then invokes the planner again when new evidence needs another decision. That workflow is application orchestration outside the LangGraph graph.
+
+```mermaid
+flowchart LR
+    START([START]) --> understand_and_plan["understand_and_plan<br/>Build a plan from the objective, inputs, memory, and registered tools"]
+    understand_and_plan --> END([END])
+```
+
+The surrounding workflow is shown separately so the README does not imply those stages are LangGraph nodes:
+
+```mermaid
+flowchart TD
+    task[Task request] --> planner[LangGraph planner]
+    planner --> validate[Validate plan and registered capabilities]
+    validate -->|unsupported or missing inputs| pause[Report limitation or request inputs]
+    validate -->|valid plan| execute[Execute registered tool step]
+    execute -->|new evidence needs another decision| planner
+    execute -->|approval required| approval[Wait for human approval]
+    approval -->|approved| execute
+    approval -->|rejected or expired| stop[Stop safely]
+    execute -->|all steps complete| result[Verify and present readable result]
+```
+
 ## Start the mock portal
 
 From the repository root:
