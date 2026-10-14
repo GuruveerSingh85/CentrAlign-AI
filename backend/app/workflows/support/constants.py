@@ -19,9 +19,12 @@ def serialized_task_state(function):
 MAX_SAFE_RETRIES = 2
 MAX_WORKFLOW_STEPS = max(1, int(os.getenv("MAX_WORKFLOW_STEPS", "50")))
 MAX_WORKFLOW_REPLANS = max(0, int(os.getenv("MAX_WORKFLOW_REPLANS", "2")))
+MAX_BROWSER_WORKFLOW_REPLANS = max(0, int(os.getenv("MAX_BROWSER_WORKFLOW_REPLANS", "8")))
 MAX_PARALLEL_STEPS = max(1, int(os.getenv("MAX_PARALLEL_STEPS", "4")))
 WORKFLOW_TIMEOUT_SECONDS = max(1, int(os.getenv("WORKFLOW_TIMEOUT_SECONDS", "300")))
 DEFAULT_TOOL_TIMEOUT_SECONDS = max(1, int(os.getenv("TOOL_TIMEOUT_SECONDS", "60")))
+EXECUTION_LEASE_SECONDS = max(60, int(os.getenv("EXECUTION_LEASE_SECONDS", "60")))
+EXECUTION_HEARTBEAT_SECONDS = max(1, EXECUTION_LEASE_SECONDS // 3)
 SAFE_RETRY_CAPABILITIES = frozenset({
     "read_company_policy",
     "check_policy",

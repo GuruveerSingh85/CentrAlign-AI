@@ -298,6 +298,48 @@ button:disabled {
   font-weight: 700;
 }
 
+.panel select {
+  width: 100%;
+  min-height: 42px;
+  margin-bottom: 14px;
+  padding: 9px 12px;
+  border: 1px solid #dce2ed;
+  border-radius: 8px;
+  color: #28354b;
+  background: #fcfdff;
+  font: inherit;
+  font-size: 12px;
+}
+
+.feedback-form {
+  display: grid;
+  gap: 5px;
+  max-width: 620px;
+}
+
+.feedback-form textarea {
+  min-height: 86px;
+  margin-bottom: 8px;
+}
+
+.feedback-form .secondary-button {
+  justify-self: start;
+}
+
+.form-error,
+.form-success {
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+
+.form-error {
+  color: #a33c36;
+}
+
+.form-success {
+  color: #13784f;
+}
+
 .panel textarea {
   display: block;
   width: 100%;
@@ -704,16 +746,35 @@ button:disabled {
 }
 
 .approval-parameters {
-  max-width: 100%;
-  max-height: 240px;
-  overflow: auto;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-  padding: 10px;
+  margin: 8px 0;
+  padding: 10px 12px;
   border: 1px solid var(--border, #e6e6ed);
-  border-radius: 6px;
+  border-radius: 8px;
   background: var(--code-background, #f5f5f9);
-  font-size: 0.82rem;
+  font-size: 0.9rem;
+}
+
+.readable-details {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.readable-details > div {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.35fr) minmax(0, 1fr);
+  gap: 12px;
+  overflow-wrap: anywhere;
+}
+
+.readable-details dt {
+  color: var(--muted, #777789);
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.readable-details dd {
+  margin: 0;
 }
 
 input {
@@ -972,6 +1033,54 @@ input {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font: 12px/1.6 Consolas, "Courier New", monospace;
+}
+
+.human-readable-result {
+  display: grid;
+  gap: 10px;
+  margin: 12px 0;
+  padding: 16px 18px;
+  border: 1px solid #cde5d9;
+  border-radius: 8px;
+  color: #173c32;
+  background: #f2faf6;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.human-readable-result > strong {
+  color: #12604b;
+  font-size: 14px;
+}
+
+.human-readable-result.partial {
+  border-color: #ead8a9;
+  background: #fffbef;
+}
+
+.human-readable-output p {
+  margin: 0 0 9px;
+}
+
+.human-readable-output h4 {
+  margin: 12px 0 6px;
+  color: #173c32;
+  font-size: 13px;
+}
+
+.human-readable-output ul,
+.human-readable-output ol {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.human-readable-output code {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #e5f0eb;
+  font-family: Consolas, "Courier New", monospace;
 }
 
 .approval-actions .primary-button {
@@ -1316,6 +1425,12 @@ button:focus-visible,
   border-color: #efcfd1;
   color: #a52b38;
   background: #fff4f4;
+}
+
+.verification-result.notice {
+  border-color: #e7dfc6;
+  color: #695726;
+  background: #fffaf0;
 }
 
 .nav-item {

@@ -54,6 +54,11 @@ export function getTaskResultPresentation(state, plan, taskStatus) {
     : Array.isArray(state)
       ? state
       : [];
+  const summarizeToolOutput = [...records].reverse()
+    .map((record) => record.outputs || record.result || record.output || null)
+    .find((output) => typeof output?.summary === "string" && output.summary.trim());
+  const savedSummaryIsVerificationFallback = /one or more steps could not be independently verified/i
+    .test(String(state?.final_summary || ""));
   const planSteps = new Map((plan?.steps || []).map((step) => [step.step, step]));
   const steps = records.map((record) => {
     const output = record.outputs || record.result || record.output || null;
@@ -109,7 +114,9 @@ export function getTaskResultPresentation(state, plan, taskStatus) {
   ];
 
   return {
-    summary: state?.final_summary || state?.error || null,
+    summary: savedSummaryIsVerificationFallback
+      ? summarizeToolOutput?.summary || state?.final_summary || state?.error || null
+      : state?.final_summary || summarizeToolOutput?.summary || state?.error || null,
     partial,
     steps,
     files,
@@ -147,10 +154,17 @@ export function getVerificationSummary(state) {
   const verification = state?.verification;
   if (!verification || typeof verification.matches !== "boolean") return null;
 
+  const unavailableStep = verification.steps?.find((step) => step.status === "unavailable");
+  const unavailable = verification.status === "unavailable" || Boolean(unavailableStep);
+
   return {
-    verified: verification.matches,
-    label: verification.matches ? "Verified against source of truth" : "Verification failed",
-    message: verification.message || "No verification detail was recorded.",
+    verified: unavailable ? null : verification.matches,
+    label: unavailable
+      ? "Independent verification unavailable"
+      : verification.matches ? "Verified against source of truth" : "Verification failed",
+    message: unavailable
+      ? unavailableStep?.message || "The result was produced, but no independent verifier is registered for this action."
+      : verification.message || "No verification detail was recorded.",
     source: verification.source || null,
     vendorId: verification.vendor_id || verification.saved_vendor?.id || null,
   };

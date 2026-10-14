@@ -1,6 +1,14 @@
 import { getApprovalProposal } from "../workflows/workflowPresentation.js";
 import { StatusBadge } from "../tasks/TaskPanels.jsx";
 
+function formatParameterValue(value) {
+  if (value == null || value === "") return "Not provided";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) return value.length ? value.map(formatParameterValue).join(", ") : "None";
+  if (typeof value === "object") return Object.entries(value).map(([key, item]) => `${key.replaceAll("_", " ")}: ${formatParameterValue(item)}`).join(" · ");
+  return String(value);
+}
+
 export default function ApprovalCenter({ approvals, busyAction, onDecide, onCancel, onOpenTask }) {
   return (
     <section className="panel approval-panel">
@@ -28,7 +36,7 @@ export default function ApprovalCenter({ approvals, busyAction, onDecide, onCanc
                 <p><strong>Target:</strong> {proposal.target || "Not specified"}</p>
                 <div>
                   <strong>Exact parameters</strong>
-                  <pre className="approval-parameters">{JSON.stringify(proposal.parameters, null, 2)}</pre>
+                  <dl className="readable-details approval-parameters">{Object.entries(proposal.parameters || {}).map(([key, value]) => <div key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{formatParameterValue(value)}</dd></div>)}</dl>
                 </div>
                 {proposal.expectedConsequences && <p><strong>Expected consequences:</strong> {proposal.expectedConsequences}</p>}
                 {proposal.risk && (

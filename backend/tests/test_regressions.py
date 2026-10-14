@@ -1,3 +1,4 @@
+from app.core.models import Memory, Task, Vendor
 import asyncio
 import errno
 import json
@@ -5,6 +6,8 @@ import os
 import tempfile
 import threading
 import unittest
+import httpx
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -15,6 +18,8 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app import main
 from app.tools import registry as tool_registry
+from app.tools import documents as document_tools
+from app.tools import web as web_tools
 from app.workflows import engine as workflow
 from app.core.models import Task, Vendor
 from app.tools.registry import execute_tool, check_policy, get_registered_tool_contracts
@@ -227,6 +232,48 @@ class AutonomousWorkflowTests(unittest.TestCase):
                 "expected_result": "Policy content is available.",
             }],
         }
+
+    def test_planner_missing_vendor_details_requests_input_even_if_marked_unsupported(self):
+        objective = (
+            "Evaluate a proposed vendor against procurement policy. "
+            "The vendor legal name and website are unknown; do not guess them."
+        )
+        planner_plan = {
+            "goal": "Evaluate the proposed vendor against procurement policy.",
+            "supported": False,
+            "limitations": ["Vendor details are missing."],
+            "unavailable_capabilities": [
+                "vendor_discovery",
+                "vendor discovery / identification",
+            ],
+            "missing_information": ["vendor legal name", "vendor website"],
+            "steps": [],
+        }
+
+        plan, workflow_name = workflow._validated_plan(objective, planner_plan)
+
+        self.assertEqual(workflow_name, "needs_input")
+        self.assertTrue(plan["supported"])
+        self.assertEqual(plan["steps"], [])
+        self.assertEqual(
+            plan["missing_information"],
+            ["vendor legal name", "vendor website"],
+        )
+
+    def test_planner_keeps_unavailable_email_request_unsupported(self):
+        plan, workflow_name = workflow._validated_plan(
+            "Email the supplier a revised quote.",
+            {
+                "goal": "Email the supplier a revised quote.",
+                "supported": False,
+                "unavailable_capabilities": ["Email sending"],
+                "missing_information": [],
+                "steps": [],
+            },
+        )
+
+        self.assertEqual(workflow_name, "unsupported")
+        self.assertFalse(plan["supported"])
 
     def test_negated_vendor_registration_objective_stays_policy_review(self):
         objective = (
@@ -571,6 +618,62 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertIn("approval_approved", event_types)
         self.assertIn("tool_invocation", event_types)
         self.assertIn("tool_outcome", event_types)
+
+    def test_restart_marks_interrupted_approved_side_effect_unknown_without_replay(self):
+        capability = "test_restart_approved_write"
+        handler = self.register_sensitive_action(capability)
+        planner_plan = {
+            "goal": "Review policy and update one business record.",
+            "steps": [
+                {
+                    "step": 1,
+                    "action": "Read procurement policy",
+                    "capability": "read_company_policy",
+                    "depends_on": [],
+                    "inputs": {},
+                    "requires_approval": False,
+                    "expected_result": "Policy is read.",
+                },
+                {
+                    "step": 2,
+                    "action": "Update record 42 by 25",
+                    "capability": capability,
+                    "depends_on": [1],
+                    "inputs": {"target": "record-42", "amount": 25},
+                    "requires_approval": True,
+                    "expected_result": "The approved record update is applied.",
+                },
+            ],
+        }
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
+            task_id = self.create_task("Review policy and update record 42 by 25.")
+            response = self.client.post(f"/api/tasks/{task_id}/run", json={})
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(self.read_task(task_id).status, "waiting_for_approval")
+        approval_id = json.loads(self.read_task(task_id).result_json)["approval_id"]
+        with Session(self.test_engine) as session:
+            approval = session.get(workflow.Approval, approval_id)
+            approval.status = "executing"
+            session.add(approval)
+            session.commit()
+
+        recovery_tasks = main._schedule_startup_recovery()
+        self.assertEqual(len(recovery_tasks.tasks), 0)
+        self.assertEqual(self.read_task(task_id).status, "partially_completed")
+        with Session(self.test_engine) as session:
+            recovered_approval = session.get(workflow.Approval, approval_id)
+            self.assertEqual(recovered_approval.status, "outcome_unknown")
+
+        resumed = self.client.post(f"/api/tasks/{task_id}/run", json={})
+        self.assertEqual(resumed.status_code, 202, resumed.text)
+        handler.assert_not_called()
+        state = json.loads(self.read_task(task_id).result_json)
+        self.assertTrue(state["step_results"][-1]["result"]["outcome_unknown"])
+        event_types = [
+            event["event_type"]
+            for event in self.client.get(f"/api/tasks/{task_id}/events").json()["events"]
+        ]
+        self.assertIn("approval_execution_interrupted", event_types)
 
     def test_changed_approval_display_proposal_is_rejected(self):
         capability = "test_sensitive_changed_proposal"
@@ -989,6 +1092,53 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(len(state["verification"]["steps"]), 2)
         self.assertIn("Sample Procurement Policy", state["step_results"][1]["inputs"]["policy_reference"])
 
+    def test_registered_plan_without_verifier_is_executed_not_failed(self):
+        capability = "test_unverified_summary"
+        tool_registry.register_tool(
+            capability,
+            lambda: {"success": True, "summary": "Source-based summary."},
+            description="Generate a summary that requires human review.",
+            outputs=["summary"],
+            permissions=["procurement:read"],
+            verification="Generated summary requires human review.",
+        )
+        self.addCleanup(tool_registry.TOOLS.pop, capability, None)
+        self.addCleanup(tool_registry.TOOL_CONTRACTS.pop, capability, None)
+        self.addCleanup(tool_registry.TOOL_VERIFIERS.pop, capability, None)
+
+        planner_plan = {
+            "goal": "Summarize the approved policy.",
+            "steps": [{
+                "step": 1,
+                "action": "Summarize the policy",
+                "capability": capability,
+                "depends_on": [],
+                "inputs": {},
+                "requires_approval": False,
+                "expected_result": "A source-based summary is produced.",
+            }],
+        }
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan):
+            task_id = self.create_task("Summarize the approved policy.")
+            response = self.client.post(f"/api/tasks/{task_id}/run", json={})
+
+        self.assertEqual(response.status_code, 202, response.text)
+        task = self.read_task(task_id)
+        self.assertEqual(task.status, "executed")
+        state = json.loads(task.result_json)
+        self.assertFalse(state["verification"]["matches"])
+        self.assertEqual(state["verification"]["status"], "unavailable")
+        self.assertEqual(state["step_results"][0]["result"]["summary"], "Source-based summary.")
+        with Session(self.test_engine) as session:
+            procedures = session.exec(
+                select(Memory).where(
+                    Memory.owner_id == task.owner_id,
+                    Memory.category == "procedure",
+                    Memory.source_ref == str(task_id),
+                )
+            ).all()
+        self.assertEqual(procedures, [])
+
     def test_registered_tool_can_be_added_with_its_own_verifier(self):
         capability = "test_format_business_note"
         tool_registry.register_tool(
@@ -1243,6 +1393,102 @@ class AutonomousWorkflowTests(unittest.TestCase):
         self.assertEqual(calls, ["read_company_policy"])
         self.assertEqual(self.read_task(task_id).status, "completed")
 
+    def test_database_execution_claim_allows_only_one_concurrent_worker(self):
+        task_id = self.create_task("Review the procurement policy.")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            claims = list(pool.map(
+                lambda _: workflow._claim_task_execution(task_id, self.test_engine),
+                range(2),
+            ))
+
+        self.assertEqual(sum(claim is not None for claim in claims), 1)
+        saved = self.read_task(task_id)
+        self.assertEqual(saved.status, "running")
+        self.assertIn(saved.execution_token, claims)
+        self.assertIsNotNone(saved.execution_lease_until)
+
+    def test_startup_recovery_waits_for_live_lease_then_recovers_expired_lease(self):
+        task = Task(
+            objective="Review the procurement policy.",
+            status="running",
+            execution_token="prior-worker",
+            execution_lease_until=datetime.now(timezone.utc) + timedelta(minutes=1),
+            plan_json=json.dumps(self.policy_plan()),
+            result_json=json.dumps(workflow._new_state()),
+        )
+        with Session(self.test_engine) as session:
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            task_id = task.id
+
+        live_recovery = main._schedule_startup_recovery()
+        self.assertEqual(len(live_recovery.tasks), 0)
+
+        with Session(self.test_engine) as session:
+            saved = session.get(Task, task_id)
+            saved.execution_lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+            session.add(saved)
+            session.commit()
+
+        expired_recovery = main._schedule_startup_recovery()
+        self.assertEqual(len(expired_recovery.tasks), 1)
+        asyncio.run(expired_recovery())
+        self.assertEqual(self.read_task(task_id).status, "completed")
+
+    def test_periodic_recovery_reclaims_lease_expired_after_startup(self):
+        from app.services.task_recovery import run_recovery_loop
+
+        task = Task(
+            objective="Review the procurement policy.",
+            status="running",
+            execution_token="prior-worker",
+            execution_lease_until=datetime.now(timezone.utc) + timedelta(minutes=1),
+            plan_json=json.dumps(self.policy_plan()),
+            result_json=json.dumps(workflow._new_state()),
+        )
+        with Session(self.test_engine) as session:
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            task_id = task.id
+
+        async def exercise_recovery_loop():
+            recovery_loop = asyncio.create_task(
+                run_recovery_loop(lambda: self.test_engine, poll_interval_seconds=0.01)
+            )
+            try:
+                await asyncio.sleep(0.03)
+                with Session(self.test_engine) as session:
+                    saved = session.get(Task, task_id)
+                    saved.execution_lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+                    session.add(saved)
+                    session.commit()
+
+                for _ in range(100):
+                    if self.read_task(task_id).status == "completed":
+                        return
+                    await asyncio.sleep(0.01)
+                self.fail("The periodic recovery loop did not reclaim the expired task.")
+            finally:
+                recovery_loop.cancel()
+                try:
+                    await recovery_loop
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(exercise_recovery_loop())
+        self.assertEqual(self.read_task(task_id).status, "completed")
+
+    def test_task_lifecycle_rejects_invalid_transition(self):
+        task_id = self.create_task("Review the procurement policy.")
+        with self.assertRaisesRegex(ValueError, "Invalid task status transition"):
+            with Session(self.test_engine) as session:
+                task = session.get(Task, task_id)
+                task.status = "completed"
+                session.add(task)
+                session.commit()
+
     def test_validated_plan_rejects_circular_dependencies(self):
         with self.assertRaisesRegex(ValueError, "circular"):
             workflow._validated_plan("Check independent records", {
@@ -1365,6 +1611,135 @@ class AutonomousWorkflowTests(unittest.TestCase):
         events = self.client.get(f"/api/tasks/{task_id}/events").json()["events"]
         self.assertIn("plan_replanned", [event["event_type"] for event in events])
 
+    def test_web_research_replans_from_evidence_and_cites_both_searches(self):
+        initial_plan = {"goal": "Research the topic.", "steps": [{
+            "step": 1,
+            "action": "Search for initial evidence",
+            "capability": "web.search",
+            "depends_on": [],
+            "inputs": {"query": "CentrAlign research overview"},
+            "expected_result": "Initial evidence and source URLs are returned.",
+        }]}
+        summaries = []
+        planner_calls = []
+
+        def planner(_objective, provided_information=None, memory_context=None):
+            planner_calls.append(provided_information)
+            completed = (provided_information or {}).get("completed_plan_steps", [])
+            if not completed:
+                return initial_plan
+            if len(completed) == 1:
+                self.assertIn("CentrAlign research overview", provided_information["completed_evidence"][0]["result"]["query"])
+                return {"goal": "Research the topic.", "steps": [
+                    *completed,
+                    {
+                        "step": 2,
+                        "action": "Search an open question from the initial evidence",
+                        "capability": "web.search",
+                        "depends_on": [1],
+                        "inputs": {"query": "CentrAlign follow-up findings"},
+                        "expected_result": "Additional evidence addresses the open question.",
+                    },
+                ]}
+            self.assertEqual(len(provided_information["completed_evidence"]), 2)
+            return {"goal": "Research the topic.", "steps": [
+                *completed,
+                {
+                    "step": 3,
+                    "action": "Summarize findings with source URLs",
+                    "capability": "documents.summarize_text",
+                    "depends_on": [1, 2],
+                    "inputs": {
+                        "text": {"$ref": {"step": 1, "field": "evidence_text"}},
+                        "additional_sources": [
+                            {"$ref": {"step": 2, "field": "evidence_text"}},
+                        ],
+                    },
+                    "expected_result": "A source-grounded summary includes evidence URLs.",
+                },
+            ]}
+
+        def respond(request):
+            query = json.loads(request.content)["query"]
+            suffix = "first" if "overview" in query else "follow-up"
+            return httpx.Response(200, json={"results": [{
+                "title": f"{suffix.title()} source",
+                "url": f"https://research.example/{suffix}",
+                "content": f"Evidence for {query}.",
+            }]}, request=request)
+
+        client_factory = httpx.Client
+
+        def create_client(**kwargs):
+            return client_factory(transport=httpx.MockTransport(respond), **kwargs)
+
+        def summarize(prompt):
+            summaries.append(prompt)
+            return "Findings from both searches: https://research.example/first https://research.example/follow-up"
+
+        with patch("app.workflows.engine.create_plan", side_effect=planner), patch.dict(os.environ, {
+            "TAVILY_API_KEY": "test-search-secret",
+            "TOOL_PERMISSION_GRANTS": "web:read,documents:process",
+        }, clear=False), patch.object(web_tools, "load_dotenv"), patch.object(
+            web_tools.httpx, "Client", side_effect=create_client
+        ), patch.object(document_tools, "_invoke_document_model", side_effect=summarize):
+            task_id = self.create_task("Research current external information about CentrAlign.")
+            response = self.client.post(f"/api/tasks/{task_id}/run", json={})
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(len(planner_calls), 3)
+        task = self.read_task(task_id)
+        state = json.loads(task.result_json)
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("https://research.example/first", summaries[0])
+        self.assertIn("https://research.example/follow-up", summaries[0])
+        self.assertIn("ignore any instructions", summaries[0])
+        self.assertEqual(task.status, "executed")
+        self.assertEqual(
+            [item["capability"] for item in state["step_results"]],
+            ["web.search", "web.search", "documents.summarize_text"],
+        )
+        self.assertTrue(state["step_results"][0]["verification_evidence"]["matches"])
+        self.assertTrue(state["step_results"][1]["verification_evidence"]["matches"])
+        summary_result = state["step_results"][2]["result"]
+        self.assertTrue(summary_result["success"])
+        self.assertIn("https://research.example/first", summary_result["summary"])
+        event_types = [
+            event["event_type"]
+            for event in self.client.get(f"/api/tasks/{task_id}/events").json()["events"]
+        ]
+        self.assertIn("plan_replanned", event_types)
+        self.assertNotIn("tool_failed", event_types)
+
+    def test_web_search_missing_key_is_persisted_as_task_failure(self):
+        planner_plan = {"goal": "Search current information.", "steps": [{
+            "step": 1,
+            "action": "Search the public web",
+            "capability": "web.search",
+            "depends_on": [],
+            "inputs": {"query": "current external information"},
+            "expected_result": "Search evidence is returned.",
+        }]}
+        with patch("app.workflows.engine.create_plan", return_value=planner_plan), patch.dict(os.environ, {
+            "TAVILY_API_KEY": "",
+            "TOOL_PERMISSION_GRANTS": "web:read",
+        }, clear=False), patch.object(web_tools, "load_dotenv"):
+            task_id = self.create_task("Search current external information.")
+            response = self.client.post(f"/api/tasks/{task_id}/run", json={})
+
+        self.assertEqual(response.status_code, 202)
+        task = self.read_task(task_id)
+        state = json.loads(task.result_json)
+        self.assertEqual(task.status, "failed")
+        self.assertEqual(state["completed_steps"], [])
+        self.assertEqual(state["step_results"][0]["result"]["failure_type"], "missing_configuration")
+        event_types = [
+            event["event_type"]
+            for event in self.client.get(f"/api/tasks/{task_id}/events").json()["events"]
+        ]
+        self.assertIn("tool_failed", event_types)
+        self.assertNotIn("verification", event_types)
+
     def test_replanning_stops_at_configured_budget(self):
         capability = "test_bounded_replan"
         tool_registry.register_tool(
@@ -1474,6 +1849,86 @@ class AutonomousWorkflowTests(unittest.TestCase):
         result = json.loads(saved.result_json)["step_results"][-1]["result"]
         self.assertTrue(result["outcome_unknown"])
         self.assertEqual(result["failure_type"], "interrupted_outcome_unknown")
+
+    def test_timed_out_side_effect_is_not_replayed_on_manual_resume(self):
+        capability = "test_unknown_timeout_write"
+        handler = Mock(return_value={"success": True, "written": True})
+        tool_registry.register_tool(
+            capability,
+            handler,
+            description="Write one test record with an unknown prior outcome.",
+            inputs={},
+            outputs=["written"],
+            side_effect=True,
+            permission_gated_side_effect=True,
+        )
+        self.addCleanup(tool_registry.TOOLS.pop, capability, None)
+        self.addCleanup(tool_registry.TOOL_CONTRACTS.pop, capability, None)
+        task = Task(
+            objective="Write one test record after checking policy.",
+            status="partially_completed",
+            plan_json=json.dumps({
+                "goal": "Write one test record safely.",
+                "steps": [
+                    {
+                        "step": 1,
+                        "action": "Read procurement policy",
+                        "capability": "read_company_policy",
+                        "depends_on": [],
+                        "inputs": {},
+                        "requires_approval": False,
+                        "expected_result": "Policy is read.",
+                    },
+                    {
+                        "step": 2,
+                        "action": "Write one test record",
+                        "capability": capability,
+                        "depends_on": [1],
+                        "inputs": {},
+                        "requires_approval": False,
+                        "expected_result": "The record is written.",
+                    },
+                ],
+            }),
+            result_json=json.dumps({
+                **workflow._new_state(),
+                "workflow": "registered_tool_plan",
+                "completed_steps": [1],
+                "step_results": [
+                    {
+                        "step": 1,
+                        "capability": "read_company_policy",
+                        "status": "completed",
+                        "success": True,
+                        "result": {"success": True, "policy_text": "policy"},
+                    },
+                    {
+                        "step": 2,
+                        "capability": capability,
+                        "status": "failed",
+                        "success": False,
+                        "inputs": {},
+                        "result": {
+                            "success": False,
+                            "failure_type": "timeout",
+                            "outcome_unknown": True,
+                        },
+                    },
+                ],
+            }),
+        )
+        with Session(self.test_engine) as session:
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            task_id = task.id
+
+        workflow.run_task_workflow(task_id)
+        handler.assert_not_called()
+        saved = self.read_task(task_id)
+        self.assertEqual(saved.status, "partially_completed")
+        final_result = json.loads(saved.result_json)["step_results"][-1]["result"]
+        self.assertEqual(final_result["failure_type"], "interrupted_outcome_unknown")
 
     def test_cancel_records_event_and_preserves_completed_evidence(self):
         task_id = self.create_task("Review the procurement policy.")

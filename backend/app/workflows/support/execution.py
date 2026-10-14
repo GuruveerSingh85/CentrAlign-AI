@@ -218,6 +218,7 @@ def _execute_observed_tool(
     step_number: int | None = None,
     timeout_seconds: float | None = None,
     owner_id: str | None = None,
+    approval_id: int | None = None,
 ) -> dict:
     run_tool = _active_tool_executor(executor)
     with Session(_session_engine()) as session:
@@ -242,6 +243,8 @@ def _execute_observed_tool(
                 parameter_names = set(inspect.signature(run_tool).parameters)
                 if owner_id is not None and "owner_id" in parameter_names:
                     executor_kwargs["owner_id"] = owner_id
+                if approval_id is not None and "approval_id" in parameter_names:
+                    executor_kwargs["approval_id"] = approval_id
                 if "task_id" in parameter_names:
                     executor_kwargs["task_id"] = task_id
             except (TypeError, ValueError):
@@ -327,8 +330,7 @@ def _finish_policy_verification(task_id: int) -> None:
         state.setdefault("timestamps", {})["completed_at"] = datetime.now(timezone.utc).isoformat()
         _save_state(task, state)
         _add_event(session, task_id, "verification", verification["message"], verification)
-        if matches:
-            record_verified_procedure(session, task, state, verification)
+        record_verified_procedure(session, task, state, verification)
         session.add(task)
         session.commit()
 
@@ -400,8 +402,7 @@ def _finish_vendor_verification(task_id: int) -> dict | None:
         state.setdefault("timestamps", {})["completed_at"] = datetime.now(timezone.utc).isoformat()
         _save_state(task, state)
         _add_event(session, task_id, "vendor_verification", verification["message"], verification)
-        if matches:
-            record_verified_procedure(session, task, state, verification)
+        record_verified_procedure(session, task, state, verification)
         session.add(task)
         session.commit()
     return verification
@@ -426,6 +427,7 @@ def _finish_registered_plan_verification(task_id: int, plan: dict) -> dict:
                 "step": step.get("step"),
                 "capability": step.get("capability"),
                 "matches": False,
+                "status": "mismatch",
                 "message": "No successful persisted tool result exists for this step.",
             })
             continue
@@ -439,6 +441,10 @@ def _finish_registered_plan_verification(task_id: int, plan: dict) -> dict:
             "step": step["step"],
             "capability": step["capability"],
             "matches": bool(verification.get("verified")),
+            "status": verification.get(
+                "status",
+                "verified" if verification.get("verified") else "mismatch",
+            ),
             "actual": verification.get("actual"),
             "message": verification.get("reason") or (
                 "The tool result matches a fresh verification."
@@ -448,8 +454,11 @@ def _finish_registered_plan_verification(task_id: int, plan: dict) -> dict:
         })
         observed["verification_evidence"] = step_verifications[-1]
 
-    matches = bool(step_verifications) and all(
-        step["matches"] for step in step_verifications
+    matches = bool(step_verifications) and all(step["matches"] for step in step_verifications)
+    verification_status = (
+        "verified" if matches
+        else "mismatch" if any(step["status"] == "mismatch" for step in step_verifications)
+        else "unavailable"
     )
     message = (
         "Every registered-tool step was independently verified."
@@ -459,6 +468,7 @@ def _finish_registered_plan_verification(task_id: int, plan: dict) -> dict:
     verification = {
         "type": "registered_tool_plan",
         "matches": matches,
+        "status": verification_status,
         "steps": step_verifications,
         "message": message,
     }
@@ -471,12 +481,15 @@ def _finish_registered_plan_verification(task_id: int, plan: dict) -> dict:
         state["step_results"] = list(results_by_step.values())
         state["verification"] = verification
         state["final_summary"] = message
-        task.status = "completed" if matches else "failed"
+        task.status = (
+            "completed" if matches
+            else "executed" if verification_status == "unavailable"
+            else "failed"
+        )
         state.setdefault("timestamps", {})["completed_at"] = datetime.now(timezone.utc).isoformat()
         _save_state(task, state)
         _add_event(session, task_id, "verification", message, verification)
-        if matches:
-            record_verified_procedure(session, task, state, verification)
+        record_verified_procedure(session, task, state, verification)
         session.add(task)
         session.commit()
     return verification

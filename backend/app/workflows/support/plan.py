@@ -15,6 +15,18 @@ def _is_json_value(value) -> bool:
     return False
 
 
+def _references(value):
+    if isinstance(value, dict):
+        if "$ref" in value:
+            yield value
+        else:
+            for item in value.values():
+                yield from _references(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _references(item)
+
+
 def _base_plan(objective: str, planner_plan: dict) -> dict:
     goal = planner_plan.get("goal")
     success_criteria = planner_plan.get("success_criteria") or []
@@ -89,6 +101,36 @@ def _validated_plan(objective: str, planner_plan: dict) -> tuple[dict, str]:
         objective_lower,
     ))
 
+    missing_vendor_policy_inputs = (
+        bool(base["missing_information"])
+        and all(
+            re.sub(r"[^a-z0-9]", "", item.lower()).startswith("vendor")
+            and any(
+                field in re.sub(r"[^a-z0-9]", "", item.lower())
+                for field in ("name", "website")
+            )
+            for item in base["missing_information"]
+        )
+        and all(
+            re.sub(r"[^a-z0-9]", "", item.lower()).startswith("vendor")
+            and any(
+                capability in re.sub(r"[^a-z0-9]", "", item.lower())
+                for capability in ("discovery", "identification")
+            )
+            for item in base["unavailable_capabilities"]
+        )
+        and "check_policy" in TOOLS
+        and bool(re.search(r"\b(vendor|supplier)\b", objective_lower))
+        and bool(re.search(r"\b(?:procurement\s+)?policy\b", objective_lower))
+    )
+    if planner_plan.get("supported") is False and missing_vendor_policy_inputs:
+        return {
+            **base,
+            "supported": True,
+            "steps": [],
+            "planner_steps": [],
+        }, "needs_input"
+
     if planner_plan.get("supported") is False and not (
         asks_for_vendor_registration and "register_vendor" in TOOLS
     ):
@@ -141,10 +183,10 @@ def _validated_plan(objective: str, planner_plan: dict) -> tuple[dict, str]:
             raise ValueError("Planner step success criteria must be a list of strings.")
 
         for input_value in inputs.values():
-            if isinstance(input_value, dict) and "$ref" in input_value:
-                reference = input_value["$ref"]
+            for reference_value in _references(input_value):
+                reference = reference_value["$ref"]
                 if (
-                    set(input_value) != {"$ref"}
+                    set(reference_value) != {"$ref"}
                     or not isinstance(reference, dict)
                     or set(reference) != {"step", "field"}
                     or reference.get("step") not in dependencies

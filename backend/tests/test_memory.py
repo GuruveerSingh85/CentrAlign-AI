@@ -12,9 +12,12 @@ from app import main
 from app.api import memory as memory_api
 from app.core.database import create_db_and_tables
 from app.services.memory import record_verified_procedure, retrieve_context, retrieve_context_safely
-from app.core.models import Memory, Task
+from app.core.models import Approval, ExecutionEvent, Memory, Task
+from app.services.agent import _ledgerly_invoice_fallback, understand_and_plan
+from app.services.procedures import record_verified_procedure
 from app.workflows import engine as workflow
 from app.workflows.support import execution
+from app.workflows.support.plan import _validated_plan
 
 
 class MemoryTests(unittest.TestCase):
@@ -102,6 +105,336 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(procedure.verification_status, "verified")
             self.assertEqual(procedure.source_ref, "72")
 
+    def test_procedure_versions_history_confidence_and_retrieval(self):
+        task = Task(
+            id=73,
+            owner_id="alice",
+            objective="Search invoice reports in authorized files",
+        )
+        state = {
+            "workflow": "registered_tool_plan",
+            "inputs": {"query": "invoice"},
+            "step_results": [{"capability": "files.search", "success": True}],
+        }
+        with Session(self.test_engine) as session:
+            first = record_verified_procedure(
+                session, task, state, {"matches": True, "type": "independent"}
+            )
+            session.commit()
+            self.assertEqual(first.procedure_successes, 1)
+            self.assertEqual(first.procedure_confidence, 1.0)
+
+            task.id = 74
+            state["step_results"] = [{"capability": "files.list", "success": True}]
+            revised = record_verified_procedure(
+                session, task, state, {"matches": True, "type": "independent"}
+            )
+            session.commit()
+            self.assertEqual(revised.procedure_version, 2)
+            self.assertEqual(json.loads(revised.evidence_json)["versions"][0]["version"], 1)
+
+            task.id = 75
+            failed = record_verified_procedure(
+                session, task, state, {"matches": False, "type": "independent"}
+            )
+            session.commit()
+            self.assertEqual(failed.procedure_successes, 2)
+            self.assertEqual(failed.procedure_failures, 1)
+            self.assertAlmostEqual(failed.procedure_confidence, 2 / 3)
+
+            task.id = 76
+            state["step_results"] = [{"capability": "files.search", "success": False}]
+            failed_before_first_step = record_verified_procedure(
+                session, task, state, {"matches": False, "type": "independent"}
+            )
+            session.commit()
+            self.assertEqual(failed_before_first_step.procedure_version, 2)
+            self.assertEqual(failed_before_first_step.procedure_failures, 2)
+            self.assertAlmostEqual(failed_before_first_step.procedure_confidence, 0.5)
+
+            context = retrieve_context(session, "alice", task.objective)
+        self.assertEqual(context["verified_procedures"][0]["procedure_version"], 2)
+        self.assertEqual(context["verified_procedures"][0]["failures"], 2)
+        self.assertEqual(context["verified_procedures"][0]["evidence"]["outcomes"][-1]["outcome"], "verification_failure")
+
+    def test_user_feedback_is_linked_but_never_promotes_procedures(self):
+        with Session(self.test_engine) as session:
+            task = Task(
+                owner_id="alice",
+                objective="Search invoice reports in authorized files",
+                status="completed",
+                plan_json=json.dumps({"steps": [{"capability": "files.search"}]}),
+                result_json=json.dumps({
+                    "verification": {"type": "file_digest", "matches": True},
+                    "step_results": [{"capability": "files.search", "success": True}],
+                }),
+            )
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            from app.services.feedback import record_task_feedback
+
+            event = record_task_feedback(
+                session,
+                task,
+                "alice",
+                "correction",
+                "The report should include invoice dates.",
+            )
+            details = json.loads(event.details_json)
+            self.assertEqual(details["capabilities"], ["files.search"])
+            self.assertEqual(details["verification_evidence"]["matches"], True)
+            self.assertEqual(details["authority"], "user_feedback_unverified")
+            self.assertEqual(session.exec(select(Memory)).all(), [])
+
+            context = retrieve_context(session, "alice", task.objective)
+        self.assertEqual(context["task_history"][0]["feedback"][0]["type"], "correction")
+        self.assertEqual(context["task_history"][0]["feedback"][0]["authority"], "unverified_user_feedback")
+
+    def test_memory_records_are_isolated_between_user_and_organization_scopes(self):
+        with patch.object(main, "engine", self.test_engine), patch.object(
+            memory_api, "engine", self.test_engine
+        ), patch.dict("os.environ", {
+            "TRUSTED_USER_HEADER": "X-Trusted-User",
+            "TRUSTED_ORG_HEADER": "X-Trusted-Org",
+        }), TestClient(main.app) as client:
+            alice = {"X-Trusted-User": "alice", "X-Trusted-Org": "north"}
+            bob = {"X-Trusted-User": "bob", "X-Trusted-Org": "north"}
+            another_org = {"X-Trusted-User": "carol", "X-Trusted-Org": "south"}
+            private = client.post("/api/memories", headers=alice, json={
+                "category": "preference", "kind": "user_instruction",
+                "content": "Use my private report template.",
+            })
+            shared = client.post("/api/memories", headers=alice, json={
+                "category": "business_context", "kind": "fact",
+                "content": "The approved invoice archive is under finance records.",
+                "memory_key": "invoice-archive-location", "scope": "organization",
+            })
+            conflicting_shared = client.post("/api/memories", headers=alice, json={
+                "category": "business_context", "kind": "fact",
+                "content": "The approved invoice archive is in legal records.",
+                "memory_key": "invoice-archive-location", "scope": "organization",
+            })
+            self.assertEqual(private.status_code, 201, private.text)
+            self.assertEqual(shared.status_code, 201, shared.text)
+            self.assertEqual(conflicting_shared.json()["verification_status"], "conflicted")
+            bob_records = client.get("/api/memories", headers=bob).json()
+            carol_records = client.get("/api/memories", headers=another_org).json()
+            self.assertEqual(len(bob_records), 2)
+            self.assertTrue(all(item["scope"] == "organization" for item in bob_records))
+            self.assertTrue(all(item["verification_status"] == "conflicted" for item in bob_records))
+            self.assertEqual(carol_records, [])
+            self.assertEqual(
+                client.get(f"/api/memories/{private.json()['id']}", headers=alice).json()["verification_status"],
+                "unverified",
+            )
+            self.assertEqual(
+                client.get(f"/api/memories/{private.json()['id']}", headers=bob).status_code,
+                404,
+            )
+            self.assertEqual(
+                client.get(f"/api/memories/{shared.json()['id']}", headers=bob).status_code,
+                200,
+            )
+
+    def test_task_feedback_api_requires_owner_and_completed_task(self):
+        with Session(self.test_engine) as session:
+            task = Task(owner_id="alice", objective="Review invoice report", status="completed")
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            task_id = task.id
+        with patch.object(main, "engine", self.test_engine), patch.dict(
+            "os.environ", {"TRUSTED_USER_HEADER": "X-Trusted-User"}
+        ), TestClient(main.app) as client:
+            payload = {"feedback_type": "usefulness", "content": "The source links were helpful."}
+            self.assertEqual(
+                client.post(f"/api/tasks/{task_id}/feedback", headers={"X-Trusted-User": "bob"}, json=payload).status_code,
+                404,
+            )
+            saved = client.post(
+                f"/api/tasks/{task_id}/feedback",
+                headers={"X-Trusted-User": "alice"},
+                json=payload,
+            )
+            self.assertEqual(saved.status_code, 201, saved.text)
+
+    def test_verified_procedure_guidance_reaches_planner_prompt(self):
+        class FakeModel:
+            def invoke(self, prompt):
+                self.prompt = prompt
+                return type("Response", (), {"content": json.dumps({"steps": []})})()
+
+        fake_model = FakeModel()
+        with patch("app.services.agent.get_model", return_value=fake_model):
+            understand_and_plan({
+                "objective": "Search invoice reports in authorized files",
+                "provided_information": {},
+                "memory_context": {
+                    "verified_procedures": [{
+                        "content": "Verified procedure: files.search",
+                        "conditions": {"objective_terms": ["invoice", "reports"]},
+                        "successes": 3,
+                        "failures": 0,
+                        "confidence": 1.0,
+                        "procedure_version": 2,
+                    }],
+                    "task_history": [{"feedback": [{"type": "correction", "authority": "unverified_user_feedback"}]}],
+                },
+                "plan": {},
+            })
+        self.assertIn("Verified procedure: files.search", fake_model.prompt)
+        self.assertIn("preferred starting sequence", fake_model.prompt)
+        self.assertIn("unverified evidence", fake_model.prompt)
+        self.assertIn("approval requirements", fake_model.prompt)
+
+    def test_planner_requires_complete_record_coverage_for_ranked_website_requests(self):
+        class FakeModel:
+            def invoke(self, prompt):
+                self.prompt = prompt
+                return type("Response", (), {"content": json.dumps({"steps": []})})()
+
+        fake_model = FakeModel()
+        with patch("app.services.agent.get_model", return_value=fake_model):
+            understand_and_plan({
+                "objective": "Find the five invoices with the largest amounts.",
+                "provided_information": {},
+                "memory_context": {},
+                "plan": {},
+            })
+
+        self.assertIn("do not infer the answer from a dashboard", fake_model.prompt)
+        self.assertIn("records/list page", fake_model.prompt)
+        self.assertIn("Compare the requested numeric/date field", fake_model.prompt)
+        self.assertIn("every in-scope record", fake_model.prompt)
+        self.assertIn("number of records", fake_model.prompt)
+        self.assertIn("compared", fake_model.prompt)
+
+    def test_planner_requires_every_matching_record_for_all_vendor_requests(self):
+        class FakeModel:
+            def invoke(self, prompt):
+                self.prompt = prompt
+                return type("Response", (), {"content": json.dumps({"steps": []})})()
+
+        fake_model = FakeModel()
+        with patch("app.services.agent.get_model", return_value=fake_model):
+            understand_and_plan({
+                "objective": "Review all invoices from Metro Facilities Group.",
+                "provided_information": {},
+                "memory_context": {},
+                "plan": {},
+            })
+
+        self.assertIn("list every matching record", fake_model.prompt)
+        self.assertIn("displayed result count", fake_model.prompt)
+        self.assertIn("historical or paid matches", fake_model.prompt)
+
+    def test_unsupported_all_vendor_invoice_request_falls_back_to_filtered_read_only_browser(self):
+        objective = "review all invoices from Metro Facilities Group"
+        unsupported = {
+            "goal": objective,
+            "supported": False,
+            "limitations": ["No registered tool can do this."],
+            "unavailable_capabilities": ["invoice_retrieval"],
+            "missing_information": [],
+            "risks": [],
+            "success_criteria": [],
+            "steps": [],
+        }
+
+        with patch("app.services.agent.default_browser_url", return_value="http://localhost:4173/dashboard"):
+            initial = _ledgerly_invoice_fallback(unsupported, objective, {})
+
+        self.assertTrue(initial["supported"])
+        self.assertEqual(initial["steps"][0]["capability"], "browser.inspect")
+        self.assertIn("search=Metro+Facilities+Group", initial["steps"][0]["inputs"]["steps"][0]["url"])
+        validated_initial, initial_status = _validated_plan(objective, initial)
+        self.assertEqual(initial_status, "registered_tool_plan")
+        self.assertEqual(validated_initial["steps"][0]["capability"], "browser.inspect")
+
+        completed = [{
+            "step": 1,
+            "action": "Inspect filtered invoice list",
+            "capability": "browser.inspect",
+            "depends_on": [],
+            "inputs": {"steps": [{"action": "navigate", "url": "http://localhost:4173/invoices?search=Metro+Facilities+Group"}]},
+            "requires_approval": False,
+            "expected_result": "Matching invoice rows",
+            "success_criteria": ["Rows captured"],
+        }]
+        continued = _ledgerly_invoice_fallback(unsupported, objective, {
+            "completed_plan_steps": completed,
+            "completed_evidence": [{
+                "capability": "browser.inspect",
+                "success": True,
+                "outputs": {"evidence_text": "3 matching records"},
+            }],
+        })
+
+        summary = continued["steps"][-1]
+        self.assertEqual(summary["capability"], "documents.summarize_text")
+        self.assertEqual(summary["depends_on"], [1])
+        self.assertEqual(summary["inputs"]["text"]["$ref"], {"step": 1, "field": "evidence_text"})
+        self.assertIn("Do not omit any matching row", summary["inputs"]["instructions"])
+        validated_continuation, continuation_status = _validated_plan(objective, continued)
+        self.assertEqual(continuation_status, "registered_tool_plan")
+        self.assertEqual(validated_continuation["steps"][-1]["capability"], "documents.summarize_text")
+
+    def test_retrieved_verified_procedure_changes_later_tool_selection(self):
+        with Session(self.test_engine) as session:
+            session.add(Memory(
+                owner_id="alice",
+                category="procedure",
+                kind="inference",
+                content="Verified procedure for Search invoice reports in authorized files: files.search",
+                memory_key="verified-procedure:invoice-search",
+                procedure_key="procedure:invoice-search",
+                procedure_successes=3,
+                procedure_confidence=1.0,
+                conditions_json=json.dumps({"objective_terms": ["invoice", "reports"]}),
+                evidence_json=json.dumps({
+                    "capabilities": ["files.search"],
+                    "outcomes": [{"outcome": "verified_success"}],
+                }),
+                source="verified_task",
+                verification_status="verified",
+            ))
+            task = Task(
+                owner_id="alice",
+                objective="Search invoice reports in authorized files",
+                status="pending",
+            )
+            session.add(task)
+            session.commit()
+            task_id = task.id
+
+        def select_from_verified_context(objective, inputs, memory_context):
+            candidates = memory_context["verified_procedures"]
+            capability = (
+                candidates[0]["evidence"]["capabilities"][0]
+                if candidates else "files.list"
+            )
+            return {"steps": [{
+                "action": "Search invoice reports",
+                "capability": capability,
+                "inputs": {"query": "invoice reports"} if capability == "files.search" else {},
+                "expected_result": "The relevant authorized files are identified.",
+                "success_criteria": ["The tool returns the relevant files."],
+            }]}
+
+        with patch.object(main, "engine", self.test_engine), patch.object(
+            memory_api, "engine", self.test_engine
+        ), patch.object(workflow, "_create_plan_with_memory", side_effect=select_from_verified_context), patch.dict(
+            "os.environ", {"TRUSTED_USER_HEADER": "X-Trusted-User"}
+        ), TestClient(main.app) as client:
+            planned = client.post(
+                f"/api/tasks/{task_id}/plan",
+                headers={"X-Trusted-User": "alice"},
+                json={},
+            )
+        self.assertEqual(planned.status_code, 200, planned.text)
+        self.assertEqual(planned.json()["plan"]["steps"][0]["capability"], "files.search")
+
     def test_policy_workflow_persists_procedure_after_independent_verification(self):
         task = Task(
             owner_id="alice",
@@ -157,13 +490,22 @@ class MemoryTests(unittest.TestCase):
                 category="business_context",
                 kind="fact",
                 content="The procurement office is in the North building.",
+                scope="organization",
+                organization_id="north",
                 verification_status="verified",
                 updated_at=datetime.now(timezone.utc) - timedelta(days=200),
             ))
             session.commit()
-            context = retrieve_context(session, "alice", "procurement office")
+            context = retrieve_context(
+                session,
+                "alice",
+                "procurement office",
+                organization_id="north",
+            )
+            isolated_context = retrieve_context(session, "alice", "procurement office")
         self.assertEqual(context["memories"][0]["verification_status"], "stale")
         self.assertTrue(context["memories"][0]["stale"])
+        self.assertEqual(isolated_context["memories"], [])
 
     def test_legacy_task_results_are_compacted_with_verification_status(self):
         with Session(self.test_engine) as session:
@@ -204,6 +546,26 @@ class MemoryTests(unittest.TestCase):
             })
             self.assertEqual(rejected.status_code, 422)
 
+            claimed_procedure = client.post("/api/memories", headers=alice, json={
+                "category": "procedure",
+                "kind": "inference",
+                "content": "Search these files first.",
+                "verification_status": "verified",
+            })
+            self.assertEqual(claimed_procedure.status_code, 422)
+            editable_procedure = client.post("/api/memories", headers=alice, json={
+                "category": "procedure",
+                "kind": "inference",
+                "content": "Unverified search sequence.",
+            })
+            corrected_procedure = client.patch(
+                f"/api/memories/{editable_procedure.json()['id']}",
+                headers=alice,
+                json={"content": "Corrected unverified search sequence."},
+            )
+            self.assertEqual(corrected_procedure.status_code, 200, corrected_procedure.text)
+            self.assertEqual(corrected_procedure.json()["verification_status"], "unverified")
+
             second = client.post("/api/memories", headers=alice, json={
                 "category": "preference",
                 "kind": "user_instruction",
@@ -243,17 +605,27 @@ class MemoryTests(unittest.TestCase):
         with patch.object(main, "engine", self.test_engine), patch.object(
             memory_api, "engine", self.test_engine
         ), patch.dict(
-            "os.environ", {"TRUSTED_USER_HEADER": "X-Trusted-User"}
+            "os.environ", {
+                "TRUSTED_USER_HEADER": "X-Trusted-User",
+                "TRUSTED_ORG_HEADER": "X-Trusted-Org",
+            }
         ), TestClient(main.app) as client:
             alice_task = client.post(
                 "/api/tasks",
-                headers={"X-Trusted-User": "alice"},
+                headers={"X-Trusted-User": "alice", "X-Trusted-Org": "north"},
                 json={"objective": "Review the procurement policy."},
             )
             bob_tasks = client.get("/api/tasks", headers={"X-Trusted-User": "bob"})
             self.assertEqual(alice_task.status_code, 200, alice_task.text)
             self.assertEqual(alice_task.json()["owner_id"], "alice")
+            self.assertEqual(alice_task.json()["organization_id"], "north")
             self.assertEqual(bob_tasks.json(), [])
+            wrong_org_plan = client.post(
+                f"/api/tasks/{alice_task.json()['id']}/plan",
+                headers={"X-Trusted-User": "alice", "X-Trusted-Org": "south"},
+                json={},
+            )
+            self.assertEqual(wrong_org_plan.status_code, 403)
             self.assertEqual(
                 client.get(
                     f"/api/tasks/{alice_task.json()['id']}/events",
@@ -261,6 +633,31 @@ class MemoryTests(unittest.TestCase):
                 ).status_code,
                 404,
             )
+            task_id = alice_task.json()["id"]
+            with Session(self.test_engine) as session:
+                session.add_all([
+                    ExecutionEvent(
+                        task_id=task_id,
+                        event_type="test_event",
+                        message="Persisted task event.",
+                    ),
+                    Approval(task_id=task_id, action_json="{}"),
+                ])
+                session.commit()
+
+            self.assertEqual(
+                client.delete(f"/api/tasks/{task_id}", headers={"X-Trusted-User": "bob"}).status_code,
+                404,
+            )
+            cleared = client.delete(
+                f"/api/tasks/{task_id}",
+                headers={"X-Trusted-User": "alice"},
+            )
+            self.assertEqual(cleared.status_code, 204, cleared.text)
+            self.assertEqual(client.get("/api/tasks", headers={"X-Trusted-User": "alice"}).json(), [])
+            with Session(self.test_engine) as session:
+                self.assertEqual(session.exec(select(ExecutionEvent)).all(), [])
+                self.assertEqual(session.exec(select(Approval)).all(), [])
 
 
 class DatabaseCompatibilityTests(unittest.TestCase):
@@ -286,13 +683,24 @@ class DatabaseCompatibilityTests(unittest.TestCase):
                         "CREATE TABLE approval (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, "
                         "action_json TEXT NOT NULL, status VARCHAR NOT NULL, decided_at DATETIME)"
                     )
+                    connection.exec_driver_sql(
+                        "CREATE TABLE memory (id INTEGER PRIMARY KEY, owner_id VARCHAR NOT NULL, "
+                        "category VARCHAR NOT NULL, kind VARCHAR NOT NULL, content VARCHAR NOT NULL, "
+                        "memory_key VARCHAR, source VARCHAR NOT NULL, source_ref VARCHAR, "
+                        "verification_status VARCHAR NOT NULL, verified_at DATETIME, expires_at DATETIME, "
+                        "active BOOLEAN NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+                    )
                 create_db_and_tables(engine)
                 with Session(engine) as session:
                     task = session.get(Task, 1)
                     self.assertEqual(task.owner_id, "default")
+                    self.assertIsNone(task.organization_id)
                 with engine.connect() as connection:
                     approval_columns = {
                         row[1] for row in connection.exec_driver_sql("PRAGMA table_info(approval)")
+                    }
+                    memory_columns = {
+                        row[1] for row in connection.exec_driver_sql("PRAGMA table_info(memory)")
                     }
                 self.assertTrue({
                     "execution_inputs_json",
@@ -302,6 +710,17 @@ class DatabaseCompatibilityTests(unittest.TestCase):
                     "decided_by",
                     "expires_at",
                 }.issubset(approval_columns))
+                self.assertTrue({
+                    "scope",
+                    "organization_id",
+                    "procedure_key",
+                    "procedure_version",
+                    "procedure_successes",
+                    "procedure_failures",
+                    "procedure_confidence",
+                    "conditions_json",
+                    "evidence_json",
+                }.issubset(memory_columns))
             finally:
                 engine.dispose()
 

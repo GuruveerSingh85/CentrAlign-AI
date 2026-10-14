@@ -89,6 +89,21 @@ describe("workflow status presentation", () => {
     assert.equal(presentation.blockingIssues[0], "Fetch source: The website is unavailable.");
   });
 
+  it("surfaces a saved summarizer answer when the final summary only reports unavailable verification", () => {
+    const presentation = getTaskResultPresentation({
+      final_summary: "One or more steps could not be independently verified.",
+      step_results: [{
+        step: 4,
+        capability: "documents.summarize_text",
+        status: "completed",
+        success: true,
+        outputs: { success: true, summary: "Invoice INV-2048 needs receipt evidence before approval." },
+      }],
+    }, { steps: [{ step: 4, action: "Summarize findings" }] }, "executed");
+
+    assert.equal(presentation.summary, "Invoice INV-2048 needs receipt evidence before approval.");
+  });
+
   it("renders the exact saved approval proposal without inventing details", () => {
     assert.deepEqual(getApprovalProposal({
       id: 8,
@@ -162,6 +177,23 @@ describe("workflow status presentation", () => {
       message: "Persisted details did not match.",
       source: null,
       vendorId: 44,
+    });
+  });
+
+  it("explains when independent verification is unavailable without labeling the task as failed", () => {
+    assert.deepEqual(getVerificationSummary({
+      verification: {
+        matches: false,
+        status: "unavailable",
+        message: "One or more steps could not be independently verified.",
+        steps: [{ status: "unavailable", message: "No independent verifier is registered for this capability." }],
+      },
+    }), {
+      verified: null,
+      label: "Independent verification unavailable",
+      message: "No independent verifier is registered for this capability.",
+      source: null,
+      vendorId: null,
     });
   });
 

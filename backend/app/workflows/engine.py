@@ -1,6 +1,7 @@
 import json
 import hashlib
 import inspect
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -21,9 +22,19 @@ from app.services.approval_control import (
 from app.core.database import engine
 from app.core.models import Approval, Task, Vendor
 from app.services.memory import retrieve_context_safely
+from app.services.task_scheduling import (
+    claim_task_execution as _claim_task_execution,
+    forget_scheduled_task,
+    refresh_execution_lease as _refresh_execution_lease,
+    release_task_execution,
+    schedule_task_workflow,
+    workflow_is_scheduled,
+)
 from app.tools.registry import TOOL_CONTRACTS, TOOLS, _schema_error, execute_tool, read_company_policy
+from app.tools.browser import browser_auto_approval_allowed
 from app.core.security import classify_action, resolve_permissions
 from app.workflows.support.constants import (
+    MAX_BROWSER_WORKFLOW_REPLANS,
     MAX_PARALLEL_STEPS,
     MAX_WORKFLOW_REPLANS,
     MAX_WORKFLOW_STEPS,
@@ -54,18 +65,15 @@ def schedule_workflow(
     background_tasks: BackgroundTasks,
     task_id: int,
     context: dict | None = None,
+    database_engine=None,
 ) -> bool:
-    with _task_lock:
-        if task_id in _scheduled_tasks:
-            return False
-        _scheduled_tasks.add(task_id)
-    background_tasks.add_task(run_task_workflow, task_id, context or {})
-    return True
-
-
-def workflow_is_scheduled(task_id: int) -> bool:
-    with _task_lock:
-        return task_id in _scheduled_tasks
+    return schedule_task_workflow(
+        background_tasks,
+        task_id,
+        run_task_workflow,
+        context,
+        database_engine or engine,
+    )
 
 
 def _step_context(step: dict, state: dict) -> dict:
@@ -85,14 +93,19 @@ def _step_context(step: dict, state: dict) -> dict:
         for item in state.get("step_results", [])
         if item.get("success")
     }
-    for key, value in step.get("inputs", {}).items():
+
+    def resolve_references(value):
         if isinstance(value, dict) and "$ref" in value:
             reference = value["$ref"]
-            source_result = result_by_step.get(reference["step"], {})
-            if reference["field"] in source_result:
-                context[key] = source_result[reference["field"]]
-        else:
-            context[key] = value
+            return result_by_step.get(reference["step"], {}).get(reference["field"])
+        if isinstance(value, dict):
+            return {key: resolve_references(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [resolve_references(item) for item in value]
+        return value
+
+    for key, value in step.get("inputs", {}).items():
+        context[key] = resolve_references(value)
 
     if step.get("capability") == "check_policy" and not context.get("policy_text"):
         context["policy_text"] = _policy_text_from_state(state)
@@ -133,11 +146,19 @@ def _mark_step_running(task_id: int, step: dict, inputs: dict) -> bool:
         state["current_step"] = step["step"]
         previous = next(
             (item for item in reversed(state["step_results"])
-             if item.get("step") == step["step"] and item.get("status") == "running"),
+             if item.get("step") == step["step"]),
             None,
         )
         contract = TOOL_CONTRACTS.get(step["capability"], {})
-        if previous and contract.get("side_effect"):
+        previous_result = (previous or {}).get("result") or {}
+        if (
+            previous
+            and contract.get("side_effect")
+            and (
+                previous.get("status") == "running"
+                or previous_result.get("outcome_unknown")
+            )
+        ):
             interrupted_side_effect = previous.get("inputs", {})
         else:
             record = {
@@ -188,7 +209,12 @@ def _request_replan(task_id: int, step: dict, result: dict) -> tuple[dict, str] 
             json.dumps(observation, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         replans = state.setdefault("replans", [])
-        if fingerprint in replans or len(replans) >= MAX_WORKFLOW_REPLANS:
+        max_replans = (
+            MAX_BROWSER_WORKFLOW_REPLANS
+            if step.get("capability") in {"browser.inspect", "browser.interact"}
+            else MAX_WORKFLOW_REPLANS
+        )
+        if fingerprint in replans or len(replans) >= max_replans:
             planning_error = {
                 "step": step["step"],
                 "replan_count": len(replans),
@@ -198,12 +224,30 @@ def _request_replan(task_id: int, step: dict, result: dict) -> tuple[dict, str] 
             replans.append(fingerprint)
         objective = task.objective
         owner_id = task.owner_id
+        finished_steps = [
+            item for item in plan.get("steps", [])
+            if item.get("step") in state.get("completed_steps", [])
+        ]
+        compact_step_numbers = {
+            item.get("step"): index
+            for index, item in enumerate(finished_steps, start=1)
+        }
+        completed_plan_steps = []
+        for index, item in enumerate(finished_steps, start=1):
+            compact = {**item, "step": index}
+            compact["depends_on"] = [
+                compact_step_numbers[dependency]
+                for dependency in item.get("depends_on", [])
+                if dependency in compact_step_numbers
+            ]
+            completed_plan_steps.append(compact)
         context = {
             **state.get("inputs", {}),
             "execution_observation": observation,
             "completed_evidence": [
                 item for item in state.get("step_results", []) if item.get("success")
             ],
+            "completed_plan_steps": completed_plan_steps,
         }
 
     if planning_error:
@@ -262,11 +306,19 @@ def _request_replan(task_id: int, step: dict, result: dict) -> tuple[dict, str] 
                 continue
             updated = {**item, "step": remapped_steps[item["step"]]}
             updated["depends_on"] = [remapped_steps[dependency] for dependency in item.get("depends_on", [])]
-            for name, value in updated.get("inputs", {}).items():
+
+            def remap_references(value):
                 if isinstance(value, dict) and "$ref" in value:
-                    value = json.loads(json.dumps(value))
-                    value["$ref"]["step"] = remapped_steps[value["$ref"]["step"]]
-                    updated["inputs"][name] = value
+                    reference = {**value["$ref"]}
+                    reference["step"] = remapped_steps[reference["step"]]
+                    return {**value, "$ref": reference}
+                if isinstance(value, dict):
+                    return {key: remap_references(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [remap_references(item) for item in value]
+                return value
+
+            updated["inputs"] = remap_references(updated.get("inputs", {}))
             appended.append(updated)
         if len(preserved) + len(appended) > MAX_WORKFLOW_STEPS:
             _write_failure(task_id, "The replanned workflow exceeds the configured step limit.")
@@ -287,7 +339,27 @@ def _request_replan(task_id: int, step: dict, result: dict) -> tuple[dict, str] 
     return updated_plan, next_workflow
 
 
-def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> None:
+def run_task_workflow(
+    task_id: int,
+    incoming_context: dict | None = None,
+    execution_token: str | None = None,
+) -> None:
+    if execution_token is None:
+        execution_token = _claim_task_execution(task_id, engine)
+        if execution_token is None:
+            return
+    with Session(engine) as session:
+        task = session.get(Task, task_id)
+        if task is None or task.execution_token != execution_token or task.status == "cancelled":
+            return
+
+    stop_heartbeat = threading.Event()
+    heartbeat = threading.Thread(
+        target=_refresh_execution_lease,
+        args=(task_id, execution_token, stop_heartbeat, engine),
+        daemon=True,
+    )
+    heartbeat.start()
     try:
         with Session(engine) as session:
             task = session.get(Task, task_id)
@@ -295,6 +367,7 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
                 return
             objective = task.objective
             owner_id = task.owner_id
+            organization_id = task.organization_id
             state = _state_from_task(task)
             state.setdefault("inputs", {})
             state.setdefault("vendor", {})
@@ -329,7 +402,12 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
 
         if should_create_plan:
             with Session(engine) as session:
-                memory_context = retrieve_context_safely(session, owner_id, objective)
+                memory_context = retrieve_context_safely(
+                    session,
+                    owner_id,
+                    objective,
+                    organization_id=organization_id,
+                )
             planner_plan = _create_plan_with_memory(
                 objective, state.get("inputs", {}), memory_context
             )
@@ -454,9 +532,34 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
                     if len(batch) >= MAX_PARALLEL_STEPS:
                         break
 
+            auto_approval_ids = {}
             for step in batch:
                 capability = step["capability"]
                 context = _step_context(step, state)
+                previous_result = next((
+                    item.get("result", {})
+                    for item in reversed(state.get("step_results", []))
+                    if item.get("step") == step["step"]
+                    and item.get("capability") == capability
+                ), {})
+                if (
+                    TOOL_CONTRACTS.get(capability, {}).get("side_effect")
+                    and previous_result.get("outcome_unknown")
+                ):
+                    _persist_step(
+                        task_id,
+                        step,
+                        {
+                            **previous_result,
+                            "error": "The prior side-effect outcome is unknown; reconcile it before retrying.",
+                            "failure_type": "interrupted_outcome_unknown",
+                            "outcome_unknown": True,
+                        },
+                        succeeded=False,
+                        completed=False,
+                        inputs=context,
+                    )
+                    return
                 if capability == "register_vendor":
                     with Session(engine) as session:
                         task = session.get(Task, task_id)
@@ -513,7 +616,13 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
                     return
                 contract = TOOL_CONTRACTS.get(capability, {})
                 risk = classify_action(contract, context)
-                if step.get("requires_approval") or risk.requires_approval:
+                needs_approval = bool(step.get("requires_approval") or risk.requires_approval)
+                browser_auto_approved = bool(
+                    capability == "browser.interact"
+                    and needs_approval
+                    and browser_auto_approval_allowed(context, task_id)
+                )
+                if needs_approval and not browser_auto_approved:
                     validation_error = _schema_error(context, contract.get("input_schema", {}))
                     if validation_error:
                         _persist_step(
@@ -563,6 +672,39 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
                         session.add(task)
                         session.commit()
                     return
+                if browser_auto_approved:
+                    validation_error = _schema_error(context, contract.get("input_schema", {}))
+                    if validation_error:
+                        _persist_step(
+                            task_id,
+                            step,
+                            {"success": False, "error": validation_error, "failure_type": "validation_error"},
+                            succeeded=False,
+                            completed=False,
+                            inputs=context,
+                        )
+                        return
+                    display_action = describe_action(capability, context, contract, risk)
+                    with Session(engine) as session:
+                        task = session.get(Task, task_id)
+                        if task is None:
+                            return
+                        approval = new_approval(task, capability, context, display_action, risk)
+                        approval.status = "approved"
+                        approval.decided_at = datetime.now(timezone.utc)
+                        approval.decided_by = "browser_auto_approval_policy"
+                        session.add(approval)
+                        session.flush()
+                        auto_approval_ids[step["step"]] = approval.id
+                        _add_event(session, task_id, "approval_autoapproved", "Browser action was approved by the configured allowlist policy.", {
+                            "approval_id": approval.id,
+                            "capability": capability,
+                            "step": step["step"],
+                            "proposed_action": display_action,
+                            "action_hash": approval.action_hash,
+                            "decided_by": approval.decided_by,
+                        })
+                        session.commit()
                 if not _mark_step_running(task_id, step, context):
                     return
 
@@ -576,6 +718,7 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
                     step_number=step["step"],
                     timeout_seconds=max(0.001, deadline - time.monotonic()),
                     owner_id=owner_id,
+                    approval_id=auto_approval_ids.get(step["step"]),
                 )
 
             if len(batch) == 1:
@@ -600,7 +743,11 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
                 )
                 if not succeeded:
                     any_failed = True
-                if result.get("replan_required") or result.get("next_action") == "replan":
+                if (
+                    result.get("replan_required")
+                    or result.get("next_action") == "replan"
+                    or (succeeded and step["capability"] == "web.search")
+                ):
                     replan_result = result
                     replan_step = step
             if replan_result is not None:
@@ -660,8 +807,24 @@ def run_task_workflow(task_id: int, incoming_context: dict | None = None) -> Non
     except Exception:
         _write_failure(task_id, "The workflow encountered an internal error and stopped safely.")
     finally:
-        with _task_lock:
-            _scheduled_tasks.discard(task_id)
+        stop_heartbeat.set()
+        try:
+            release_task_execution(task_id, execution_token, engine)
+        finally:
+            forget_scheduled_task(task_id)
+            try:
+                with Session(engine) as session:
+                    task = session.get(Task, task_id)
+                    task_status = task.status if task is not None else "missing"
+                if task_status not in {
+                    "waiting_for_approval", "awaiting_approval", "waiting_for_input",
+                    "needs_input", "planned", "pending", "running", "processing",
+                }:
+                    from app.tools.browser import close_browser_session
+
+                    close_browser_session(task_id)
+            except Exception:
+                pass
 
 
 def decide_vendor_approval(
@@ -704,6 +867,9 @@ def decide_vendor_approval(
             session.add(approval)
             session.add(task)
             session.commit()
+            from app.tools.browser import close_browser_session
+
+            close_browser_session(task_id)
             raise HTTPException(status_code=410, detail="This approval has expired.")
 
         capability = approval.capability or "register_vendor"
@@ -775,6 +941,9 @@ def decide_vendor_approval(
             })
             session.add(task)
             session.commit()
+            from app.tools.browser import close_browser_session
+
+            close_browser_session(task_id)
             return {"approval_id": approval_id, "task_id": task_id, "status": "rejected"}
 
         decided_at = datetime.now(timezone.utc)
@@ -798,6 +967,7 @@ def decide_vendor_approval(
             execution_parameters,
             approval_id=approval_id,
             owner_id=owner_id,
+            task_id=task_id,
         )
         _persist_step(
             task_id,

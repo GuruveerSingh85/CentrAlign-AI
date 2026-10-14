@@ -8,7 +8,7 @@ from app.api.middleware import install_api_middleware
 from app.api.approvals import create_approval_router
 from app.core.database import engine
 from app.api.tasks import create_task_router
-from app.services.task_recovery import schedule_startup_recovery
+from app.services.task_recovery import run_recovery_loop, schedule_startup_recovery
 
 
 def _schedule_startup_recovery() -> BackgroundTasks:
@@ -23,7 +23,19 @@ async def lifespan(app: FastAPI):
     recovery_tasks = _schedule_startup_recovery()
     if recovery_tasks.tasks:
         app.state.workflow_recovery_task = asyncio.create_task(recovery_tasks())
-    yield
+    recovery_loop = asyncio.create_task(run_recovery_loop(lambda: engine))
+    app.state.workflow_recovery_loop = recovery_loop
+    try:
+        yield
+    finally:
+        recovery_loop.cancel()
+        try:
+            await recovery_loop
+        except asyncio.CancelledError:
+            pass
+        from app.tools.browser import close_all_browser_sessions
+
+        close_all_browser_sessions()
 
 
 app = FastAPI(

@@ -24,7 +24,7 @@ export function TaskComposer({
         <div className="heading-icon">✧</div>
         <div>
           <h2>New task</h2>
-          <p>Describe the outcome, provide context, and review the plan before execution.</p>
+          <p>Describe the outcome and provide context. Website tasks use the configured default site when you omit its URL.</p>
         </div>
       </div>
 
@@ -64,19 +64,19 @@ export function TaskComposer({
           type="submit"
           disabled={!!busyAction || !objective.trim()}
         >
-          {busyAction === "planning" ? "Preparing plan..." : "Preview plan"}
+          {busyAction === "planning" ? "Preparing plan..." : busyAction === "running" ? "Running task..." : "Create and run task"}
         </button>
       </form>
 
       <div className="capability-note">
         <strong>Execution safeguards</strong>
-        <p>Only registered backend tools may run. Sensitive actions pause for explicit approval, and reported outcomes are verified against backend evidence.</p>
+        <p>Only registered backend tools may run. Browser actions on configured allowlisted sites can run automatically when enabled; other sensitive actions still pause for approval.</p>
       </div>
     </div>
   );
 }
 
-export function TaskHistory({ tasks, selectedId, loading, onSelect }) {
+export function TaskHistory({ tasks, selectedId, loading, onSelect, onClear, busyAction }) {
   return (
     <div className="panel history-panel">
       <div className="history-heading">
@@ -105,6 +105,17 @@ export function TaskHistory({ tasks, selectedId, loading, onSelect }) {
                   {task.created_at ? new Date(task.created_at).toLocaleString() : "Date unavailable"}
                 </div>
               </button>
+              <div className="task-actions">
+                <button
+                  className="secondary-button danger-button"
+                  type="button"
+                  onClick={() => onClear(task)}
+                  disabled={!!busyAction || ["running", "processing", "waiting_for_input", "needs_input", "waiting_for_approval", "awaiting_approval", "partially_completed"].includes(task.status)}
+                  aria-label={`Clear history for task ${task.id}`}
+                >
+                  Clear history
+                </button>
+              </div>
             </article>
           ))}
         </div>

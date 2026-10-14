@@ -12,6 +12,8 @@ _DEFAULT_GRANTS = {
     "procurement:write",
     "business:read",
     "approval:decide",
+    "web:read",
+    "web:interact",
 }
 _SECRET_KEY = re.compile(r"(?i)(?:api[_ -]?key|access[_ -]?token|password|passwd|client[_ -]?secret|private[_ -]?key)")
 _SECRET_VALUE = re.compile(

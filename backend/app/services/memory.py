@@ -4,9 +4,11 @@ import re
 import json
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import and_, or_
 from sqlmodel import Session, select
 
-from app.core.models import Memory, Task, utc_now
+from app.core.models import ExecutionEvent, Memory, Task, utc_now
+from app.services.procedures import record_verified_procedure as _record_verified_procedure
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{1,40}", re.IGNORECASE)
 _CREDENTIAL_PATTERN = re.compile(
@@ -59,25 +61,51 @@ def _memory_is_stale(memory: Memory, now: datetime) -> bool:
     age_limit = _STALE_AFTER.get(memory.category)
     if age_limit is None:
         return False
-    updated_at = memory.updated_at
-    if updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
-    return updated_at + age_limit <= now
+    freshness_at = (
+        memory.verified_at
+        if memory.category == "procedure" and memory.verified_at is not None
+        else memory.updated_at
+    )
+    if freshness_at.tzinfo is None:
+        freshness_at = freshness_at.replace(tzinfo=timezone.utc)
+    return freshness_at + age_limit <= now
 
 
 def _memory_context_item(memory: Memory, now: datetime) -> dict:
     stale = _memory_is_stale(memory, now)
-    return {
+    item = {
         "id": memory.id,
         "category": memory.category,
         "kind": memory.kind,
         "content": memory.content,
         "source": memory.source,
         "source_ref": memory.source_ref,
+        "scope": memory.scope,
+        "organization_id": memory.organization_id,
         "created_at": memory.created_at.isoformat(),
         "verification_status": "stale" if stale else memory.verification_status,
         "stale": stale,
+        "conflicted": memory.verification_status == "conflicted",
     }
+    if memory.category == "procedure":
+        item.update({
+            "procedure_key": memory.procedure_key,
+            "procedure_version": memory.procedure_version,
+            "successes": memory.procedure_successes,
+            "failures": memory.procedure_failures,
+            "confidence": memory.procedure_confidence,
+            "conditions": _json_object(memory.conditions_json),
+            "evidence": _json_object(memory.evidence_json),
+        })
+    return item
+
+
+def _json_object(value: str | None) -> dict:
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, TypeError):
+        return {}
 
 
 def retrieve_context(
@@ -87,16 +115,24 @@ def retrieve_context(
     *,
     memory_limit: int = 8,
     history_limit: int = 3,
+    organization_id: str | None = None,
 ) -> dict:
     """Return a bounded, relevance-ranked context without serializing full history."""
     now = utc_now()
     query_terms = _terms(query)
-    memories = session.exec(
-        select(Memory).where(
-            Memory.owner_id == owner_id,
-            Memory.active == True,  # noqa: E712
-        ).order_by(Memory.updated_at.desc())
-    ).all()
+    memory_scope = and_(Memory.scope == "user", Memory.owner_id == owner_id)
+    if organization_id:
+        memory_scope = or_(
+            memory_scope,
+            and_(
+                Memory.scope == "organization",
+                Memory.organization_id == organization_id,
+            ),
+        )
+    memories = session.exec(select(Memory).where(
+        memory_scope,
+        Memory.active == True,  # noqa: E712
+    ).order_by(Memory.updated_at.desc())).all()
     ranked_memories = []
     for memory in memories:
         score = _score(query_terms, memory.content)
@@ -118,6 +154,36 @@ def retrieve_context(
         .order_by(Task.updated_at.desc())
         .limit(100)
     ).all()
+    feedback_by_task: dict[int, list[dict]] = {}
+    task_ids = [task.id for task in tasks if task.id is not None]
+    if task_ids:
+        feedback_events = session.exec(
+            select(ExecutionEvent)
+            .where(
+                ExecutionEvent.task_id.in_(task_ids),
+                ExecutionEvent.event_type == "user_feedback",
+            )
+            .order_by(ExecutionEvent.created_at.desc())
+        ).all()
+        for event in feedback_events:
+            try:
+                details = json.loads(event.details_json or "{}")
+            except (ValueError, TypeError):
+                continue
+            if (
+                not isinstance(details, dict)
+                or details.get("authority") != "user_feedback_unverified"
+            ):
+                continue
+            feedback_by_task.setdefault(event.task_id, []).append({
+                "type": details.get("feedback_type"),
+                "content": _safe_summary(details.get("content", "")),
+                "capabilities": details.get("capabilities", [])[:20],
+                "procedure_refs": details.get("procedure_refs", [])[:10],
+                "verification_evidence": details.get("verification_evidence"),
+                "authority": "unverified_user_feedback",
+                "created_at": event.created_at.isoformat(),
+            })
     ranked_history = []
     for task in tasks:
         score = _score(query_terms, task.objective)
@@ -166,25 +232,49 @@ def retrieve_context(
                 else "unverified"
             ),
             "updated_at": task.updated_at.isoformat(),
+            "feedback": feedback_by_task.get(task.id, [])[:3],
         }))
     ranked_history.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
 
+    selected_memories = [
+        _memory_context_item(memory, now)
+        for _, memory in ranked_memories[:memory_limit]
+    ]
+    verified_procedures = [
+        item for item in selected_memories
+        if item["category"] == "procedure"
+        and item["verification_status"] == "verified"
+        and not item["stale"]
+        and not item["conflicted"]
+        and item["procedure_key"]
+    ]
+
     return {
-        "memories": [
-            _memory_context_item(memory, now)
-            for _, memory in ranked_memories[:memory_limit]
-        ],
+        "memories": selected_memories,
+        "verified_procedures": verified_procedures,
         "task_history": [item for _, item in ranked_history[:history_limit]],
         "retrieval_status": "available",
     }
 
 
-def retrieve_context_safely(session: Session, owner_id: str, query: str) -> dict:
+def retrieve_context_safely(
+    session: Session,
+    owner_id: str,
+    query: str,
+    *,
+    organization_id: str | None = None,
+) -> dict:
     try:
-        return retrieve_context(session, owner_id, query)
+        return retrieve_context(
+            session,
+            owner_id,
+            query,
+            organization_id=organization_id,
+        )
     except Exception:
         return {
             "memories": [],
+            "verified_procedures": [],
             "task_history": [],
             "retrieval_status": "unavailable",
         }
@@ -196,37 +286,4 @@ def record_verified_procedure(
     state: dict,
     verification: dict,
 ) -> Memory | None:
-    if verification.get("matches") is not True:
-        return None
-    capabilities = [
-        item.get("capability")
-        for item in state.get("step_results", [])
-        if item.get("success") and isinstance(item.get("capability"), str)
-    ]
-    if not capabilities:
-        return None
-    memory_key = f"verified-task:{task.id}"
-    existing = session.exec(
-        select(Memory).where(
-            Memory.owner_id == task.owner_id,
-            Memory.memory_key == memory_key,
-        )
-    ).first()
-    if existing is not None:
-        return existing
-    workflow_name = state.get("workflow") or "registered_tool_plan"
-    content = f"Verified procedure ({workflow_name}): " + " -> ".join(capabilities)
-    validate_memory_content(content)
-    memory = Memory(
-        owner_id=task.owner_id,
-        category="procedure",
-        kind="inference",
-        content=content,
-        memory_key=memory_key,
-        source="verified_task",
-        source_ref=str(task.id),
-        verification_status="verified",
-        verified_at=utc_now(),
-    )
-    session.add(memory)
-    return memory
+    return _record_verified_procedure(session, task, state, verification)

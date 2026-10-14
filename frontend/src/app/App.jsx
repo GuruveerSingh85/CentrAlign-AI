@@ -4,6 +4,7 @@ import { apiRequest } from "../api/api.js";
 import { TaskComposer, TaskHistory } from "../features/tasks/TaskPanels.jsx";
 import ExecutionMonitor from "../features/tasks/ExecutionMonitor.jsx";
 import ApprovalCenter from "../features/approvals/ApprovalCenter.jsx";
+import LedgerlySite from "../ledgerly/LedgerlySite.jsx";
 import "./App.css";
 
 function formatRunNotice(result) {
@@ -33,7 +34,7 @@ function formatRunNotice(result) {
   }
 }
 
-export default function App() {
+function AgentDashboard() {
   const [objective, setObjective] = useState("");
   const [taskInputsText, setTaskInputsText] = useState("");
   const [vendor, setVendor] = useState({
@@ -56,6 +57,7 @@ export default function App() {
   const [memories, setMemories] = useState([]);
   const [memoryDraft, setMemoryDraft] = useState({
     category: "preference",
+    scope: "user",
     kind: "user_instruction",
     content: "",
     memory_key: "",
@@ -241,7 +243,19 @@ export default function App() {
       setPlan(preview.plan);
       setObjective("");
       setTaskInputsText("");
-      setNotice("Plan saved. Review the steps and expected results before starting execution.");
+      if (preview.plan?.supported && Array.isArray(preview.plan.steps) && preview.plan.steps.length > 0
+          && !(preview.plan.missing_information || []).length) {
+        setBusyAction("running");
+        const runResult = await apiRequest(`/tasks/${createdTask.id}/run`, {
+          method: "POST",
+          body: JSON.stringify({}),
+        });
+        setNotice(formatRunNotice(runResult));
+      } else if ((preview.plan?.missing_information || []).length) {
+        setNotice("The task needs more information before it can run. Add the missing details and submit again.");
+      } else {
+        setNotice("The plan is ready, but this task has no supported actions to run.");
+      }
       await Promise.all([loadTasks(), loadApprovals()]);
       await loadTaskDetails(createdTask.id);
     } catch (err) {
@@ -276,6 +290,31 @@ export default function App() {
       await loadTaskDetails(task.id);
     } catch (err) {
       setError(err.message || "The task could not be started.");
+    } finally {
+      actionLock.current = false;
+      setBusyAction("");
+    }
+  }
+
+  async function clearTaskHistory(task) {
+    if (actionLock.current || !window.confirm(`Clear task #${task.id} and permanently delete its plan, result, and history?`)) return;
+
+    actionLock.current = true;
+    setBusyAction("clearing-history");
+    setError("");
+    setNotice("");
+    try {
+      await apiRequest(`/tasks/${task.id}`, { method: "DELETE" });
+      const remainingTasks = await loadTasks();
+      if (selectedId === task.id) {
+        const nextTask = remainingTasks[0];
+        setSelectedId(nextTask?.id ?? null);
+        await loadTaskDetails(nextTask?.id);
+      }
+      await loadApprovals();
+      setNotice(`Task #${task.id} and its history were cleared.`);
+    } catch (err) {
+      setError(err.message || "Task history could not be cleared.");
     } finally {
       actionLock.current = false;
       setBusyAction("");
@@ -435,6 +474,7 @@ export default function App() {
       );
       setMemoryDraft({
         category: "preference",
+        scope: "user",
         kind: "user_instruction",
         content: "",
         memory_key: "",
@@ -455,6 +495,7 @@ export default function App() {
     setEditingMemoryId(memory.id);
     setMemoryDraft({
       category: memory.category,
+      scope: memory.scope || "user",
       kind: memory.kind,
       content: memory.content,
       memory_key: memory.memory_key || "",
@@ -537,6 +578,9 @@ export default function App() {
         >
           ✓ &nbsp; Approval inbox ({approvals.length})
         </button>
+        <a className="nav-item" href="/dashboard" target="_blank" rel="noreferrer">
+          ◫ &nbsp; Ledgerly mock site
+        </a>
 
         <div className="sidebar-note">
           <p>Turn business requests into verified actions, approvals, and evidence.</p>
@@ -616,6 +660,17 @@ export default function App() {
                 <form onSubmit={saveMemory}>
                   <div className="memory-form-grid">
                     <label>
+                      Scope
+                      <select
+                        value={memoryDraft.scope}
+                        disabled={!!editingMemoryId}
+                        onChange={(event) => setMemoryDraft((current) => ({ ...current, scope: event.target.value }))}
+                      >
+                        <option value="user">User</option>
+                        <option value="organization">Organization</option>
+                      </select>
+                    </label>
+                    <label>
                       Category
                       <select value={memoryDraft.category} onChange={(event) => setMemoryDraft((current) => ({ ...current, category: event.target.value }))}>
                         <option value="preference">Preference</option>
@@ -634,9 +689,13 @@ export default function App() {
                     </label>
                     <label>
                       Verification
-                      <select value={memoryDraft.verification_status} onChange={(event) => setMemoryDraft((current) => ({ ...current, verification_status: event.target.value }))}>
+                      <select
+                        value={memoryDraft.category === "procedure" ? "unverified" : memoryDraft.verification_status}
+                        disabled={memoryDraft.category === "procedure"}
+                        onChange={(event) => setMemoryDraft((current) => ({ ...current, verification_status: event.target.value }))}
+                      >
                         <option value="unverified">Unverified</option>
-                        <option value="verified">Verified</option>
+                        {memoryDraft.category !== "procedure" && <option value="verified">Verified</option>}
                       </select>
                     </label>
                     <label>
@@ -662,7 +721,7 @@ export default function App() {
                       {editingMemoryId ? "Save correction" : "Add memory"}
                     </button>
                     {editingMemoryId && (
-                      <button className="secondary-button" type="button" onClick={() => { setEditingMemoryId(null); setMemoryDraft({ category: "preference", kind: "user_instruction", content: "", memory_key: "", source: "user", verification_status: "unverified" }); }}>
+                      <button className="secondary-button" type="button" onClick={() => { setEditingMemoryId(null); setMemoryDraft({ category: "preference", scope: "user", kind: "user_instruction", content: "", memory_key: "", source: "user", verification_status: "unverified" }); }}>
                         Cancel
                       </button>
                     )}
@@ -721,9 +780,14 @@ export default function App() {
                   </div>
                   <p>{memory.content}</p>
                   <div className="memory-provenance">
-                    <span>Source: {memory.source}{memory.source_ref ? ` · ${memory.source_ref}` : ""}</span>
+                    <span>{memory.scope === "organization" ? `Organization: ${memory.organization_id}` : "User scope"} · Source: {memory.source}{memory.source_ref ? ` · ${memory.source_ref}` : ""}</span>
                     <span>{memory.created_at ? new Date(memory.created_at).toLocaleString() : ""}</span>
                   </div>
+                  {memory.category === "procedure" && memory.procedure_key && (
+                    <p className="task-meta">
+                      Version {memory.procedure_version} · {memory.procedure_successes} verified successes · {memory.procedure_failures} verification failures · confidence {Math.round(memory.procedure_confidence * 100)}%
+                    </p>
+                  )}
                   <div className="task-actions">
                     <button className="secondary-button" type="button" onClick={() => editMemory(memory)}>Edit</button>
                     <button className="secondary-button danger-button" type="button" onClick={() => removeMemory(memory.id)} disabled={!!busyAction}>Delete</button>
@@ -749,6 +813,8 @@ export default function App() {
                 tasks={tasks}
                 selectedId={selectedId}
                 loading={loading}
+                busyAction={busyAction}
+                onClear={clearTaskHistory}
                 onSelect={(task) => {
                   setSelectedId(task.id);
                   setVendor({ name: "", website: "", registration_number: "" });
@@ -772,6 +838,7 @@ export default function App() {
               setVendor={setVendor}
               clarification={clarification}
               setClarification={setClarification}
+              onFeedbackSaved={() => loadTaskDetails(selectedId)}
             />
           </section>
         )}
@@ -792,4 +859,10 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+export default function App() {
+  const path = window.location.pathname;
+  const isLedgerlyRoute = /^\/(dashboard|invoices|vendors|purchase-orders|payment-approvals|payment-runs|knowledge-base|activity|help)(\/|$)/.test(path);
+  return isLedgerlyRoute ? <LedgerlySite /> : <AgentDashboard />;
 }

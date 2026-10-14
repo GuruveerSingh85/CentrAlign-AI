@@ -3,6 +3,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import delete
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from sqlalchemy.engine import Engine
 from sqlmodel import Field, Session, SQLModel, select
@@ -10,7 +11,8 @@ from sqlmodel import Field, Session, SQLModel, select
 from app.workflows import engine as workflow
 from app.core.models import Approval, ExecutionEvent, Task
 from app.core.security import contains_secret_material
-from app.workflows.engine import schedule_workflow, workflow_is_scheduled
+from app.services.feedback import FEEDBACK_TYPES, record_task_feedback
+from app.workflows.engine import schedule_workflow
 
 
 class TaskCreate(SQLModel):
@@ -22,6 +24,11 @@ class RunTaskRequest(SQLModel):
     vendor_website: str | None = None
     registration_number: str | None = None
     inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskFeedback(SQLModel):
+    feedback_type: str
+    content: str
 
 
 def _task_inputs(payload: RunTaskRequest) -> dict[str, Any]:
@@ -72,6 +79,7 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
                 objective=objective,
                 status="pending",
                 owner_id=request.state.owner_id,
+                organization_id=request.state.organization_id,
             )
             session.add(task)
             session.commit()
@@ -88,6 +96,23 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
             )
             return session.exec(statement).all()
 
+    @router.delete("/api/tasks/{task_id}", status_code=204)
+    def delete_task(task_id: int, request: Request):
+        with Session(engine_provider()) as session:
+            task = _owned_task(session, task_id, request.state.owner_id)
+            if task is None:
+                raise HTTPException(status_code=404, detail="Task not found.")
+            if task.status in {
+                "running", "processing", "waiting_for_input", "needs_input",
+                "waiting_for_approval", "awaiting_approval", "partially_completed",
+            }:
+                raise HTTPException(status_code=409, detail="An active task cannot be cleared from history.")
+
+            session.exec(delete(ExecutionEvent).where(ExecutionEvent.task_id == task_id))
+            session.exec(delete(Approval).where(Approval.task_id == task_id))
+            session.delete(task)
+            session.commit()
+
     @router.post("/api/tasks/{task_id}/plan")
     def plan_task(
         task_id: int,
@@ -99,6 +124,8 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
             task = _owned_task(session, task_id, request.state.owner_id)
             if task is None:
                 raise HTTPException(status_code=404, detail="Task not found")
+            if task.organization_id and task.organization_id != request.state.organization_id:
+                raise HTTPException(status_code=403, detail="The task's trusted organization identity is required.")
             if task.status not in {"pending", "planned", "waiting_for_input", "needs_input"}:
                 raise HTTPException(
                     status_code=409,
@@ -107,6 +134,7 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
 
             objective = task.objective
             owner_id = task.owner_id
+            organization_id = task.organization_id
             state = workflow._state_from_task(task)
             _merge_task_inputs(state, inputs)
             state.pop("error", None)
@@ -120,7 +148,12 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
 
         try:
             with Session(engine_provider()) as session:
-                memory_context = workflow.retrieve_context_safely(session, owner_id, objective)
+                memory_context = workflow.retrieve_context_safely(
+                    session,
+                    owner_id,
+                    objective,
+                    organization_id=organization_id,
+                )
             planner_plan = workflow._create_plan_with_memory(objective, inputs, memory_context)
             plan, next_workflow = workflow._validated_plan(objective, planner_plan)
         except Exception as exc:
@@ -196,6 +229,31 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
                 ],
             }
 
+    @router.post("/api/tasks/{task_id}/feedback", status_code=201)
+    def submit_task_feedback(task_id: int, payload: TaskFeedback, request: Request):
+        if payload.feedback_type not in FEEDBACK_TYPES:
+            raise HTTPException(status_code=422, detail="Unsupported feedback type.")
+        with Session(engine_provider()) as session:
+            task = _owned_task(session, task_id, request.state.owner_id)
+            if task is None:
+                raise HTTPException(status_code=404, detail="Task not found.")
+            try:
+                event = record_task_feedback(
+                    session,
+                    task,
+                    request.state.owner_id,
+                    payload.feedback_type,
+                    payload.content,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {
+                "id": event.id,
+                "task_id": task_id,
+                "feedback_type": payload.feedback_type,
+                "created_at": event.created_at,
+            }
+
     @router.post("/api/tasks/{task_id}/run", status_code=202)
     def run_task(
         task_id: int,
@@ -208,6 +266,8 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
             task = _owned_task(session, task_id, request.state.owner_id)
             if task is None:
                 raise HTTPException(status_code=404, detail="Task not found.")
+            if task.organization_id and task.organization_id != request.state.organization_id:
+                raise HTTPException(status_code=403, detail="The task's trusted organization identity is required.")
             if task.status not in {
                 "pending", "planned", "waiting_for_input", "needs_input",
                 "running", "processing", "partially_completed",
@@ -216,16 +276,14 @@ def create_task_router(engine_provider: Callable[[], Engine]) -> APIRouter:
                     status_code=409,
                     detail=f"Task cannot run from status '{task.status}'.",
                 )
-            if task.status in {"running", "processing"} and workflow_is_scheduled(task_id):
-                raise HTTPException(status_code=409, detail="This task is already running.")
-
             was_processing = task.status in {"running", "processing"}
-            task.status = "running"
-            task.updated_at = datetime.now(timezone.utc)
-            session.add(task)
-            session.commit()
 
-        if not schedule_workflow(background_tasks, task_id, vendor_context):
+        if not schedule_workflow(
+            background_tasks,
+            task_id,
+            vendor_context,
+            database_engine=engine_provider(),
+        ):
             raise HTTPException(status_code=409, detail="This task is already running.")
         return {
             "task_id": task_id,

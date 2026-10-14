@@ -33,12 +33,41 @@ def create_db_and_tables(target_engine=None) -> None:
             column["name"]
             for column in inspect(database_engine).get_columns("task")
         }
-        if "owner_id" not in columns:
-            with database_engine.begin() as connection:
-                connection.execute(text(
-                    "ALTER TABLE task ADD COLUMN owner_id VARCHAR NOT NULL DEFAULT 'default'"
-                ))
+        additions = {
+            "owner_id": "VARCHAR NOT NULL DEFAULT 'default'",
+            "organization_id": "VARCHAR",
+            "execution_token": "VARCHAR",
+            "execution_lease_until": "DATETIME",
+        }
+        with database_engine.begin() as connection:
+            for name, column_type in additions.items():
+                if name not in columns:
+                    connection.execute(text(
+                        f"ALTER TABLE task ADD COLUMN {name} {column_type}"
+                    ))
     SQLModel.metadata.create_all(database_engine)
+    if inspect(database_engine).has_table("memory"):
+        columns = {
+            column["name"]
+            for column in inspect(database_engine).get_columns("memory")
+        }
+        additions = {
+            "scope": "VARCHAR NOT NULL DEFAULT 'user'",
+            "organization_id": "VARCHAR",
+            "procedure_key": "VARCHAR",
+            "procedure_version": "INTEGER NOT NULL DEFAULT 1",
+            "procedure_successes": "INTEGER NOT NULL DEFAULT 0",
+            "procedure_failures": "INTEGER NOT NULL DEFAULT 0",
+            "procedure_confidence": "FLOAT NOT NULL DEFAULT 0",
+            "conditions_json": "TEXT",
+            "evidence_json": "TEXT",
+        }
+        with database_engine.begin() as connection:
+            for name, column_type in additions.items():
+                if name not in columns:
+                    connection.execute(text(
+                        f"ALTER TABLE memory ADD COLUMN {name} {column_type}"
+                    ))
     if inspect(database_engine).has_table("approval"):
         columns = {
             column["name"]

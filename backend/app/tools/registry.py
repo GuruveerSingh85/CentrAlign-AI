@@ -581,9 +581,18 @@ def get_registered_tool_contracts() -> list[dict]:
     for capability, tool in TOOLS.items():
         contract = TOOL_CONTRACTS.get(capability, {})
         risk = classify_action(contract, {})
+        description = contract.get("description") or tool.__doc__ or capability
+        if capability in {"api.read", "api.write"}:
+            from app.tools.api import configured_operations
+
+            operations = configured_operations(mutation=capability == "api.write")
+            if operations:
+                description += " Configured operations and their input schemas: " + json.dumps(
+                    operations, ensure_ascii=True, sort_keys=True,
+                )
         contracts.append({
             "capability": capability,
-            "description": contract.get("description") or tool.__doc__ or capability,
+            "description": description,
             "inputs": contract.get("inputs", {}),
             "input_schema": contract.get("input_schema", _object_schema(contract.get("inputs", {}))),
             "outputs": contract.get("outputs", []),
@@ -697,12 +706,22 @@ def verify_registered_tool(
     """Run the verifier registered for a tool, or report that verification is unavailable."""
     verifier = TOOL_VERIFIERS.get(capability)
     if verifier is None:
-        return {"verified": False, "reason": "No independent verifier is registered for this capability."}
+        return {
+            "verified": False,
+            "status": "unavailable",
+            "reason": "No independent verifier is registered for this capability.",
+        }
     try:
-        return verifier(context or {}, observed_result)
+        result = verifier(context or {}, observed_result)
+        result.setdefault("status", "verified" if result.get("verified") else "mismatch")
+        return result
     except Exception:
         logger.exception("Registered verifier for %s failed", capability)
-        return {"verified": False, "reason": "The registered verifier failed safely."}
+        return {
+            "verified": False,
+            "status": "unavailable",
+            "reason": "The registered verifier failed safely.",
+        }
 
 
 def _verify_policy_read(_context: dict, observed_result: dict) -> dict:
@@ -950,12 +969,15 @@ def execute_tool(
                 session.commit()
 
     try:
+        tool_arguments = arguments
+        if capability in {"browser.inspect", "browser.interact"} and task_id is not None:
+            tool_arguments = {**arguments, "_task_id": task_id}
         parameters = inspect.signature(tool).parameters
         if "context" in parameters or any(
             parameter.kind == inspect.Parameter.VAR_POSITIONAL
             for parameter in parameters.values()
         ):
-            result = tool(arguments)
+            result = tool(tool_arguments)
         else:
             result = tool()
         if not isinstance(result, dict) or not isinstance(result.get("success"), bool):
@@ -996,9 +1018,14 @@ def execute_tool(
 
 
 from app.tools.documents import register_document_tools
+from app.tools.api import register_api_tools
+from app.tools.browser import register_browser_tools
 from app.tools.files import register_file_tools
-from app.tools.web import register_web_tools
+from app.tools.web import register_web_search_tool, register_web_tools
 
 register_file_tools(register_tool)
 register_document_tools(register_tool)
+register_web_search_tool(register_tool)
 register_web_tools(register_tool)
+register_api_tools(register_tool)
+register_browser_tools(register_tool)
